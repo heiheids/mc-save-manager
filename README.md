@@ -62,7 +62,7 @@
 
 ## 截图
 
-> 待补充
+![主界面](https://github.com/user-attachments/assets/89de1e7f-b991-46e6-80b3-c4b45369b57a)
 
 ---
 
@@ -234,7 +234,7 @@ With multiple selections, `_1`, `_2`, `_3` suffixes are appended automatically.
 
 ## Screenshots
 
-> Coming soon
+![Main window](https://github.com/user-attachments/assets/89de1e7f-b991-46e6-80b3-c4b45369b57a)
 
 ---
 
