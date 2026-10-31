@@ -1,11 +1,19 @@
+<a id="chinese"></a>
+
 # Minecraft 存档管理器
 <img width="1282" height="792" alt="2026-10-31_150612" src="https://github.com/user-attachments/assets/89de1e7f-b991-46e6-80b3-c4b45369b57a" />
 
 一个用 Rust 写的 Minecraft 存档编辑器。直接在存档文件层面编辑世界，
 不依赖游戏运行，支持 **1.21.1** 到 **26.4 快照**。
 
+> A Minecraft save editor written in Rust. Edits the world at the save-file
+> level without needing the game running. Supports **1.21.1** through
+> **26.4 snapshots**. [Jump to English](#english)
+
 ![版本](https://img.shields.io/badge/version-1.0.1-brightgreen)
 ![协议](https://img.shields.io/badge/license-GPL--3.0-blue)
+
+**中文** | [English](#english)
 
 ---
 
@@ -155,3 +163,181 @@ docs/
 [GPL-3.0](LICENSE) © 黑山大叔
 
 本项目与 Mojang Studios / Microsoft 无关，Minecraft 是其注册商标。
+
+
+---
+---
+
+<a id="english"></a>
+
+# Minecraft Save Manager
+
+[中文](#chinese) | **English**
+
+A Minecraft save editor written in Rust. It edits the world directly at the
+save-file level — no need for the game to be running. Supports **1.21.1**
+through **26.4 snapshots**.
+
+![version](https://img.shields.io/badge/version-1.0.1-brightgreen)
+![license](https://img.shields.io/badge/license-GPL--3.0-blue)
+
+---
+
+## Features
+
+### Map browsing
+
+- Renders the world map straight from `.mca` region files — the game does not
+  need to be running
+- Overworld / Nether / End, switchable at any time (**switching never discards
+  already-loaded data**)
+- Surface detection uses *"the topmost non-air block that has air directly
+  above it"*, so caves, tree canopies and the Nether ceiling are handled
+  correctly
+- Chunk grid overlay, jump-to-coordinates, go-to-player / go-to-spawn, fit-all
+- Status bar shows the cursor's **coordinates / chunk / biome** in real time
+
+### Chunk editing
+
+- Drag-select any rectangle and delete those chunks
+- **Multi-location selection**: tick the box, accumulate several regions, then
+  delete them all or export them in one go
+- Copy / paste chunks, including block entities and entities
+- Per-chunk entity type breakdown; clear entities from a single chunk
+
+### Save properties
+
+- Level name, seed, game mode, difficulty, cheats, hardcore
+- Spawn point and player position
+- Game rules (58 of them, with readable names)
+
+### Import / export
+
+| Format | Notes |
+|---|---|
+| `.litematic` | Litematica schematic (stores non-air blocks only) |
+| `.smclip` | [SwiftMap](https://github.com/heiheids) clipboard format (full snapshot incl. air / biomes / entities, max 7×7 chunks) |
+
+With multiple selections, `_1`, `_2`, `_3` suffixes are appended automatically.
+
+### Safety
+
+- **Automatic backup before every write**, timestamped, kept in a `backups/`
+  folder next to the save
+- Toolbar **Undo** restores the previous operation in one click
+- Delete / paste / property changes are written immediately, with automatic
+  backup
+- `session.lock` detection distinguishes *"the game is really running"* from
+  *"the file is just read-only"*, so it does not produce false lock reports
+
+---
+
+## Screenshots
+
+> Coming soon
+
+---
+
+## Building
+
+### Prerequisites
+
+- [Rust](https://rustup.rs) 1.80 or newer
+- A C linker (pick one):
+  - **MSVC**: install Visual Studio Build Tools with *"Desktop development
+    with C++"*
+  - **MinGW**: install the mingw-w64 toolchain from MSYS2
+
+### Standard build
+
+```bash
+git clone https://github.com/heiheids/mc-save-manager.git
+cd mc-save-manager
+cargo build --release
+```
+
+The binary lands at `target/release/mcworld-app.exe`.
+
+### C-toolchain-free build (what the author uses)
+
+If you would rather not install MSVC or MinGW, you can use rustup's bundled
+`rust-lld` with the gnullvm target. See `.cargo/config.local.toml.example`,
+copy it to `.cargo/config.toml` and fix up the paths, then:
+
+```bash
+cargo build --target x86_64-pc-windows-gnullvm
+```
+
+### Icon patching (only needed for the toolchain-free build)
+
+The example config links `crates/app/assets/icon_obj.obj` (a COFF object with
+a `.rsrc` section). Resource data entries inside a COFF object can only hold
+section-relative offsets; after linking they must be turned into global RVAs,
+otherwise Windows cannot read the icon:
+
+```bash
+node .build/patch_rsrc_rva.js target/x86_64-pc-windows-gnullvm/debug/mcworld-app.exe --write
+```
+
+`build.cmd` already runs this step.
+
+---
+
+## Project layout
+
+```
+crates/
+  core/                 # UI-independent save-file library
+    src/nbt.rs          # NBT codec (Java Modified UTF-8, byte-exact round-trip)
+    src/anvil.rs        # .mca region files (4KiB sectors, zlib/gzip/LZ4/none, external .mcc)
+    src/chunk.rs        # Chunk parsing, block palette, heightmaps, surface sampling
+    src/world.rs        # level.dat (dual format: 1.21.1 vs 26.x), dimension discovery
+    src/edit.rs         # Chunk copy / paste / delete, entity filtering
+    src/safety.rs       # Pre-write backup, session rollback
+    src/regions.rs      # Connectivity clustering of loaded regions
+    src/colors.rs       # Block map colours (including new 26.x blocks)
+    src/swiftmap.rs     # SwiftMap minimap data (.smr, read-only)
+    src/smclip.rs       # SwiftMap clipboard format (.smclip, read/write)
+  app/                  # eframe/egui desktop UI
+    src/main.rs         # App state, tabs, per-dimension views
+    src/panels.rs       # Top bar / toolbar / sidebar / status bar / windows
+    src/map_view.rs     # Map rendering, camera, selection interaction
+    src/jobs.rs         # Background tasks (scan / sample / delete / export)
+    src/lang.rs         # Localised names (reads the user's .minecraft at runtime)
+    src/theme.rs        # Cream / olive colour scheme
+    assets/             # Icons
+docs/
+  开发说明.md           # Detailed development log and lessons learned (Chinese)
+```
+
+---
+
+## Known limitations
+
+- **Map sampling is a full scan** — large saves (tens of thousands of chunks)
+  take 10–20 seconds on first load
+- The map is built from a save scan; SwiftMap's tile data is not yet used to
+  speed it up
+- `.litematic` / `.schem` files can be exported but **not imported** yet
+- Encrypted / locked saves can only be browsed read-only
+- Only tested on Windows
+
+---
+
+## Localised names
+
+Block / biome / entity / item names come from Minecraft's **official language
+file**, copyright Mojang / Microsoft. This project **does not bundle that
+file**; it reads it at runtime from your own `.minecraft/assets/` directory.
+
+When the file cannot be found (e.g. the game was installed but never launched),
+the program falls back to raw registry names and does not crash.
+
+---
+
+## License
+
+[GPL-3.0](LICENSE) © 黑山大叔 (heishandashu)
+
+This project is not affiliated with Mojang Studios or Microsoft.
+Minecraft is a trademark of Mojang Synergies AB.
