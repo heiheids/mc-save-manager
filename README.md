@@ -1,4 +1,5 @@
 # Minecraft 存档管理器
+<img width="1282" height="792" alt="2026-10-31_150612" src="https://github.com/user-attachments/assets/89de1e7f-b991-46e6-80b3-c4b45369b57a" />
 
 一个用 Rust 写的 Minecraft 存档编辑器。直接在存档文件层面编辑世界，
 不依赖游戏运行，支持 **1.21.1** 到 **26.4 快照**。
