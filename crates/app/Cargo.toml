@@ -1,0 +1,19 @@
+[package]
+name = "mcworld-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Minecraft 存档管理器 GUI"
+
+[dependencies]
+mcworld-core = { path = "../core" }
+
+# 只启用 glow（OpenGL）后端：wgpu 会拖入 rustls/ring 等需要 C 编译器的依赖，
+# 而本机没有可用的 C 工具链。
+eframe = { version = "0.32", default-features = false, features = [
+    "default_fonts",
+    "glow",
+] }
+egui = "0.32"
+rfd = "0.15"
+flate2 = "1"

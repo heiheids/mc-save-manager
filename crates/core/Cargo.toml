@@ -1,0 +1,12 @@
+[package]
+name = "mcworld-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Minecraft Java 存档（Anvil/NBT）读写内核"
+
+[dependencies]
+flate2 = "1"
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame", "safe-encode", "safe-decode"] }
+indexmap = "2"
+thiserror = "1"

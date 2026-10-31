@@ -1,0 +1,21 @@
+﻿# 本机构建配置（不提交到 Git）。
+[source.crates-io]
+replace-with = "rsproxy"
+
+[source.rsproxy]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+retry = 5
+
+[target.x86_64-pc-windows-gnullvm]
+linker = ".toolchain/rustup/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu/bin/rust-lld.exe"
+rustflags = [
+  "-C", "linker-flavor=ld.lld",
+  "-C", "link-self-contained=yes",
+  "-C", "link-arg=-L.toolchain/rustup/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu/lib/self-contained",
+  "-C", "link-arg=-L.toolchain/rustup/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnullvm/lib",
+  "-C", "link-arg=.toolchain/rustup/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu/lib/self-contained/libgcc_eh.a",
+  "-C", "link-arg=--subsystem", "-C", "link-arg=windows",
+  "-C", "link-arg=crates/app/assets/icon_obj.obj",
+]

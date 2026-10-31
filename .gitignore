@@ -1,0 +1,41 @@
+# ---- 构建产物 ----
+target/
+build/
+发布/
+存档管理器工程备份/
+
+# ---- 本机工具链与中间文件 ----
+.toolchain/
+.build/
+
+# ---- 本机专用构建配置（含绝对路径）----
+.cargo/config.local.toml
+
+# ---- 参考资料与临时脚本 ----
+tools/
+
+# ---- 开发期的临时验证脚本 ----
+# 这些 example 直接指向开发者本机的测试存档路径（D:/26.3F/.minecraft 之类），
+# 对其他人没有意义，只会编译失败。核心库的单元测试已覆盖同样的逻辑。
+crates/core/examples/probe_*.rs
+crates/core/examples/verify_*.rs
+crates/core/examples/bench_*.rs
+crates/core/examples/e2e_*.rs
+crates/core/examples/regions_real.rs
+crates/app/examples/mini_ui.rs
+
+# ---- 游戏存档数据，绝不提交 ----
+*.mca
+*.mcc
+*.dat
+level.dat*
+session.lock
+saves/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store

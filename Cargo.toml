@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/app"]
+
+[workspace.package]
+version = "1.0.1"
+edition = "2021"
+rust-version = "1.80"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+# 本机无法完成 release 构建：release 会为 proc-macro 单独编译一份，
+# 而 gnu host 下这需要 Cygwin dlltool，在沙箱里起不来（详见 build.cmd）。
+# 因此把 dev profile 调到接近 release 的优化水平，日常直接用 dev 产物。
+[profile.dev]
+opt-level = 1
+incremental = true
+
+# 去掉调试符号。
+#
+# Rust 的 debug 构建默认带完整 DWARF 调试信息，会往 exe 里塞
+# 130MB+ 的 .debug_str / .debug_info / .debug_loc 等节，
+# 而程序本体（.text + .rdata）只有约 7MB。
+#
+# 实测：debug=0 + strip 之后，exe 从 145MB 降到约 10MB。
+# 需要断点调试时，临时把这两行注释掉即可。
+debug = 0
+strip = "debuginfo"

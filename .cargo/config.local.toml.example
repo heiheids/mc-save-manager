@@ -1,0 +1,25 @@
+﻿# 本机专用构建配置示例（零 C 工具链方案）。
+#
+# 用法：复制本文件为 .cargo/config.toml
+#
+# 这套配置不需要安装 MSVC / MinGW：
+#   host   = stable-x86_64-pc-windows-gnu（已缓存的 proc-macro 可复用）
+#   target = x86_64-pc-windows-gnullvm（std 自包含，不依赖 dlltool）
+# 链接用 rustup 自带 rust-lld 的 ld.lld 驱动 + gnu 目标自带的自包含 CRT。
+#
+# 注意：路径里的 <rustup> 要换成你自己的 rustup 安装位置。
+#       默认一般是 %USERPROFILE%\.rustup
+
+[target.x86_64-pc-windows-gnullvm]
+linker = "<rustup>/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu/bin/rust-lld.exe"
+rustflags = [
+  "-C", "linker-flavor=ld.lld",
+  "-C", "link-self-contained=yes",
+  "-C", "link-arg=-L<rustup>/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu/lib/self-contained",
+  "-C", "link-arg=-L<rustup>/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnullvm/lib",
+  "-C", "link-arg=<rustup>/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu/lib/self-contained/libgcc_eh.a",
+  # GUI 子系统：双击启动不弹控制台窗口
+  "-C", "link-arg=--subsystem", "-C", "link-arg=windows",
+  # 程序图标：预编译好的 COFF 对象（含 .rsrc 节），lld 可直接链接
+  "-C", "link-arg=crates/app/assets/icon_obj.obj",
+]
