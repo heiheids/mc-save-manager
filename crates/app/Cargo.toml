@@ -10,9 +10,16 @@ mcworld-core = { path = "../core" }
 
 # 只启用 glow（OpenGL）后端：wgpu 会拖入 rustls/ring 等需要 C 编译器的依赖，
 # 而本机没有可用的 C 工具链。
+#
+# ⚠ 必须显式开启 x11 / wayland：
+#   关掉 default-features 会连带关掉 winit 的平台后端，Linux 上会报
+#   "The platform you're compiling for is not supported by winit"。
+#   这两个特性只在 Linux 生效，Windows / macOS 上是空操作。
 eframe = { version = "0.32", default-features = false, features = [
     "default_fonts",
     "glow",
+    "x11",
+    "wayland",
 ] }
 egui = "0.32"
 rfd = "0.15"

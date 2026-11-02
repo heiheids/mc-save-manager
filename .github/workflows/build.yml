@@ -67,7 +67,7 @@ jobs:
             out: MinecraftSaveManager-linux-x64
 
           - name: macOS-x64
-            os: macos-13
+            os: macos-14
             target: x86_64-apple-darwin
             artifact: mcworld-app
             out: MinecraftSaveManager-macos-x64
