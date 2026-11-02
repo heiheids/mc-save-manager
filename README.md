@@ -66,6 +66,27 @@
 
 ---
 
+## 下载
+
+直接到 [Releases](https://github.com/heiheids/mc-save-manager/releases) 页面下载对应平台的版本，
+不需要自己编译：
+
+| 平台 | 文件 |
+|---|---|
+| Windows x64 | `MinecraftSaveManager-windows-x64.exe` |
+| Linux x64 | `MinecraftSaveManager-linux-x64` |
+| macOS Intel | `MinecraftSaveManager-macos-x64` |
+| macOS Apple Silicon | `MinecraftSaveManager-macos-arm64` |
+
+Linux / macOS 下载后需要先给执行权限：
+
+```bash
+chmod +x MinecraftSaveManager-linux-x64
+./MinecraftSaveManager-linux-x64
+```
+
+---
+
 ## 编译
 
 ### 前置条件
@@ -235,6 +256,27 @@ With multiple selections, `_1`, `_2`, `_3` suffixes are appended automatically.
 ## Screenshots
 
 ![Main window](https://github.com/user-attachments/assets/89de1e7f-b991-46e6-80b3-c4b45369b57a)
+
+---
+
+## Download
+
+Grab a prebuilt binary from the [Releases](https://github.com/heiheids/mc-save-manager/releases)
+page — no need to build anything:
+
+| Platform | File |
+|---|---|
+| Windows x64 | `MinecraftSaveManager-windows-x64.exe` |
+| Linux x64 | `MinecraftSaveManager-linux-x64` |
+| macOS Intel | `MinecraftSaveManager-macos-x64` |
+| macOS Apple Silicon | `MinecraftSaveManager-macos-arm64` |
+
+On Linux / macOS you need to mark the file executable first:
+
+```bash
+chmod +x MinecraftSaveManager-linux-x64
+./MinecraftSaveManager-linux-x64
+```
 
 ---
 
