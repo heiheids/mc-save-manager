@@ -707,6 +707,60 @@ impl App {
         self.jobs.spawn_sample(root, dim, need, mode);
     }
 
+    /// 把当前维度**所有**还没采样的区块排进队列（「全图」确认后调用）。
+    ///
+    /// 不能复用 `request_viewport_sample(None)` —— 那条路径会退回到
+    /// "出生点半径 20"，全图缩放下根本排不到远处的区块，
+    /// 表现出来就是地图一直空白。
+    ///
+    /// 分批提交：每批 1024 个，剩下的靠后续帧继续排，
+    /// 避免一帧塞进八万个区块把 UI 卡死。
+    pub fn request_sample_all(&mut self) {
+        const MAX_PER_BATCH: usize = 1024;
+
+        let mode = self.slice_mode();
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+
+        let mut need: Vec<(i32, i32)> = Vec::new();
+        {
+            let v = tab.view();
+            for c in tab.chunks_of_current() {
+                let key = (c.x, c.z);
+                if v.map.contains(key) || v.pending.contains(&key) {
+                    continue;
+                }
+                need.push(key);
+                if need.len() >= MAX_PER_BATCH {
+                    break;
+                }
+            }
+        }
+
+        if need.is_empty() {
+            // 全都加载完了
+            tab.view_mut().loading = false;
+            self.set_status("全图区块已全部加载", StatusKind::Success);
+            return;
+        }
+
+        {
+            let v = tab.view_mut();
+            for k in &need {
+                v.pending.insert(*k);
+            }
+            v.loading = true;
+        }
+
+        let dim = match tab.dim().cloned() {
+            Some(d) => d,
+            None => return,
+        };
+        let root = tab.path.clone();
+        self.jobs.spawn_sample(root, dim, need, mode);
+    }
+
     /// 为当前维度启动地图采样。
     ///
     /// 每个维度的采样状态独立记录在 `DimView::sampled` 里，
@@ -761,6 +815,8 @@ impl App {
 
     /// 处理后台任务返回。
     fn handle_results(&mut self, ctx: &egui::Context, results: Vec<JobResult>) {
+        // 全图加载：某批完成后需要继续排下一批
+        let mut more_after_full = false;
         for r in results {
             match r {
                 JobResult::Scanned {
@@ -866,6 +922,12 @@ impl App {
                             } else {
                                 v.expand_stage = 2;
                             }
+                            // 全图加载中：这一批做完就接着排下一批。
+                            // 不这样做的话，request_sample_all 只排了 1024 个，
+                            // 剩下的永远不会被处理，地图停在半空状态。
+                            if v.full_loaded {
+                                more_after_full = true;
+                            }
                         }
                         // 只要队列空了就撤掉"加载中"，不必等 complete：
                         // 中途可能有新批次插进来，死等 complete 会让提示卡住。
@@ -944,6 +1006,11 @@ impl App {
                 }
                 JobResult::Info(m) => self.set_status(m, StatusKind::Info),
             }
+        }
+
+        // 全图加载：接着排下一批（每批 1024）
+        if more_after_full {
+            self.request_sample_all();
         }
     }
 
@@ -1075,12 +1142,10 @@ impl eframe::App for App {
             }
         }
 
-        // 「全图」确认后：强制下一帧按视口重新排队
+        // 「全图」确认后：把**整个维度**的区块排进队列
         if self.load_all_pending {
             self.load_all_pending = false;
-            // 视口加载在 map_area 里做，这里只需要确保标记被清掉、
-            // 并且立刻请求一次补加载。
-            self.request_viewport_sample(None);
+            self.request_sample_all();
         }
 
         // 重载存档请求

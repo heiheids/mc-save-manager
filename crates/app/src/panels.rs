@@ -1186,8 +1186,10 @@ pub fn map_area(app: &mut App, ctx: &egui::Context) {
                         .on_hover_text("缩放到能看见全部区块（会按需加载，可能较慢）")
                         .clicked()
                     {
-                        fit_all(tab);
-                        // 全图之后视口会覆盖整张地图，需要确认是否真的加载
+                        // 先弹确认框，**不要**立刻 fit_all：
+                        // 早期写法是先缩放再弹框，但缩放会让视口立刻变大，
+                        // 视口加载在下一帧就会把成千上万个区块排进队列，
+                        // 用户还没点"确认"就已经开始读盘了 —— 确认框形同虚设。
                         let n = tab.chunk_count();
                         pending_load_all = Some(n);
                     }
@@ -1474,9 +1476,18 @@ fn fit_all(tab: &mut WorldTab) {
     let cx = (min_x + max_x) as f32 * 8.0 + 8.0;
     let cz = (min_z + max_z) as f32 * 8.0 + 8.0;
     let span = ((max_x - min_x).max(max_z - min_z) as f32 * 16.0).max(32.0);
+
+    // ★ 缩放下限必须允许"很小"：
+    //   大存档跨度可达 47000 方块（82419 个区块），要塞进 ~1400 像素的画布，
+    //   需要 0.03 甚至更小。原来 clamp 到 0.05，全图就只能看到一片边角，
+    //   看起来像"全图没生效"。
+    //
+    //   这里按 1500 像素估算画布宽度（实际窗口宽度会略有出入，
+    //   但低到 0.005 已经足够，差几十像素看不出来）。
+    let canvas_w = 1500.0_f32;
     let v = tab.view_mut();
     v.camera.center = Vec2::new(cx, cz);
-    v.camera.scale = (900.0 / span).clamp(0.05, 4.0);
+    v.camera.scale = (canvas_w / span).clamp(0.002, 4.0);
 }
 
 /// 底部状态栏。
@@ -1829,8 +1840,9 @@ fn execute_confirmed(app: &mut App, action: ConfirmAction) {
                 "正在加载全图区块，请稍候…（已加载过的会跳过）",
                 StatusKind::Info,
             );
-            // 清掉 last_view_center，强制下一帧重新计算视口
+            // 先缩放，再清视口缓存让下一帧重新排队 —— 顺序不能反。
             if let Some(tab) = app.tabs.get_mut(app.active) {
+                fit_all(tab);
                 let v = tab.view_mut();
                 v.last_view_center = None;
                 v.full_loaded = true;

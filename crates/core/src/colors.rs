@@ -30,6 +30,12 @@ fn table() -> HashMap<&'static str, Rgb> {
     put(&["sandstone", "smooth_sandstone", "cut_sandstone"], [216, 203, 155]);
     put(&["red_sandstone"], [184, 97, 32]);
     put(&["snow", "snow_block", "powder_snow"], [249, 254, 254]);
+    // 测试 26.3 大存档时发现缺配色的方块（浮萍、仙人掌花等）
+    put(&["lily_pad"], [32, 88, 40]);
+    put(&["cactus_flower"], [228, 116, 168]);
+    put(&["bone_block"], [229, 225, 203]);
+    // 16 色地毯：默认按白毯处理，其它颜色差异不大，地图上看不出
+    put(&["white_carpet"], [233, 236, 236]);
     put(&["ice", "frosted_ice", "packed_ice", "blue_ice"], [160, 190, 220]);
 
     // 石类

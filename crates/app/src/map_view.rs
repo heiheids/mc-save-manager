@@ -95,6 +95,14 @@ impl TileCache {
         });
     }
 
+    /// 遍历所有已生成的缩略图（绘制用）。
+    ///
+    /// 绘制时改成遍历这个而不是遍历可见矩形：
+    /// 全图缩放下可见矩形有几十万格点，但实际有纹理的只有已加载的那部分。
+    pub fn iter(&self) -> impl Iterator<Item = (&(i32, i32), &ChunkTile)> {
+        self.tiles.iter()
+    }
+
     pub fn get(&self, key: (i32, i32)) -> Option<&ChunkTile> {
         self.tiles.get(&key)
     }
@@ -144,7 +152,11 @@ impl Default for MapCamera {
 }
 
 impl MapCamera {
-    pub const MIN_SCALE: f32 = 0.02;
+    /// 最小缩放。
+    ///
+    /// 必须允许很小：大存档（8 万区块、跨度 4.7 万方块）要装进约 1400 像素的
+    /// 画布，需要 0.03 以下。「全图」依赖这个下限能到 0.002。
+    pub const MIN_SCALE: f32 = 0.002;
     pub const MAX_SCALE: f32 = 24.0;
 
     pub fn zoom_by(&mut self, factor: f32, anchor: Pos2, viewport: Rect) {
@@ -291,38 +303,63 @@ pub fn draw(
 
     // ---- 绘制区块 ----
     let visible = cam.visible_world_rect(rect);
-    let cx0 = (visible.min.x / 16.0).floor() as i32 - 1;
-    let cx1 = (visible.max.x / 16.0).ceil() as i32 + 1;
-    let cz0 = (visible.min.y / 16.0).floor() as i32 - 1;
-    let cz1 = (visible.max.y / 16.0).ceil() as i32 + 1;
-
     let chunk_px = 16.0 * cam.scale;
     let mut drawn = 0usize;
 
-    for cx in cx0..=cx1 {
-        for cz in cz0..=cz1 {
-            let world_min = Vec2::new(cx as f32 * 16.0, cz as f32 * 16.0);
-            let p0 = cam.world_to_screen(world_min, rect);
-            let cell = Rect::from_min_size(p0, Vec2::splat(chunk_px));
+    // ★ 遍历**已有的缩略图**，而不是遍历可见矩形。
+    //
+    //   旧写法是按 cx/cz 双重循环走一遍可见范围。在 1.0× 时这没问题，
+    //   但缩到全图（0.05×）时可见矩形覆盖整个 82419 区块，
+    //   每帧要迭代约 55 万次 —— 而其中 99% 的格点根本没有区块。
+    //   结果是帧率掉到个位数、地图看起来像卡死。
+    //
+    //   改成遍历缓存里的纹理（最多几万个），先用四叉判断是否在视野内，
+    //   再画。开销只跟"已加载的区块数"有关，与缩放级别无关。
+    for (&(cx, cz), tile) in cache.iter() {
+        let world_min = Vec2::new(cx as f32 * 16.0, cz as f32 * 16.0);
+        // 视野裁剪：区块整块落在视野外就跳过
+        if world_min.x > visible.max.x
+            || world_min.y > visible.max.y
+            || world_min.x + 16.0 < visible.min.x
+            || world_min.y + 16.0 < visible.min.y
+        {
+            continue;
+        }
+        let p0 = cam.world_to_screen(world_min, rect);
+        let cell = Rect::from_min_size(p0, Vec2::splat(chunk_px));
+        painter.image(
+            tile.texture.id(),
+            cell,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        drawn += 1;
+    }
 
-            match cache.get((cx, cz)) {
-                Some(tile) => {
-                    painter.image(
-                        tile.texture.id(),
-                        cell,
-                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
-                    drawn += 1;
-                }
-                None => {
-                    // 未采样：按是否有数据画不同底色（由缓存标记）
-                    if !cache.contains((cx, cz)) {
-                        // 尚未采样，画占位
-                        painter.rect_filled(cell, 0.0, Color32::from_rgb(0x26, 0x29, 0x2E));
-                    } else {
-                        painter.rect_filled(cell, 0.0, Color32::from_rgb(0x1E, 0x20, 0x24));
+    // 还没采样的区域：只在**放大到足够近**时才画占位格。
+    // 缩得很小时画占位没有意义（一片糊），反而浪费绘制调用。
+    if chunk_px >= 4.0 {
+        let cx0 = (visible.min.x / 16.0).floor() as i32 - 1;
+        let cx1 = (visible.max.x / 16.0).ceil() as i32 + 1;
+        let cz0 = (visible.min.y / 16.0).floor() as i32 - 1;
+        let cz1 = (visible.max.y / 16.0).ceil() as i32 + 1;
+        // 再兜一层保险：限制单帧占位格数量
+        let cells = ((cx1 - cx0 + 1) as i64) * ((cz1 - cz0 + 1) as i64);
+        if cells <= 20_000 {
+            for cx in cx0..=cx1 {
+                for cz in cz0..=cz1 {
+                    if cache.get((cx, cz)).is_some() {
+                        continue;
                     }
+                    let world_min = Vec2::new(cx as f32 * 16.0, cz as f32 * 16.0);
+                    let p0 = cam.world_to_screen(world_min, rect);
+                    let cell = Rect::from_min_size(p0, Vec2::splat(chunk_px));
+                    let bg = if !cache.contains((cx, cz)) {
+                        Color32::from_rgb(0x26, 0x29, 0x2E)
+                    } else {
+                        Color32::from_rgb(0x1E, 0x20, 0x24)
+                    };
+                    painter.rect_filled(cell, 0.0, bg);
                 }
             }
         }
@@ -337,11 +374,16 @@ pub fn draw(
             Color32::from_black_alpha(45)
         };
         let grid = Stroke::new(1.0, color);
-        for cx in cx0..=cx1 {
+        // 网格线只在可见范围内画；缩得极小时线距不足 1 像素，直接跳过
+        let gx0 = (visible.min.x / 16.0).floor() as i32;
+        let gx1 = (visible.max.x / 16.0).ceil() as i32;
+        let gz0 = (visible.min.y / 16.0).floor() as i32;
+        let gz1 = (visible.max.y / 16.0).ceil() as i32;
+        for cx in gx0..=gx1 {
             let x = cam.world_to_screen(Vec2::new(cx as f32 * 16.0, 0.0), rect).x;
             painter.line_segment([Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)], grid);
         }
-        for cz in cz0..=cz1 {
+        for cz in gz0..=gz1 {
             let y = cam.world_to_screen(Vec2::new(0.0, cz as f32 * 16.0), rect).y;
             painter.line_segment([Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)], grid);
         }
