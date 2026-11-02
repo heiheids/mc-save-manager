@@ -190,6 +190,52 @@ pub struct ChunkMeta {
 }
 
 impl ChunkMeta {
+    /// 从已解压的区块 NBT 构造索引信息。
+    ///
+    /// 供"局部重扫"使用：只读指定范围的区块，不像全量扫描那样
+    /// 走一遍 region 文件。`sectors` 无法从区块内容得知，
+    /// 这里填 0（只影响"体积"列的展示，不影响功能）。
+    pub fn from_tag(cx: i32, cz: i32, tag: &Tag) -> Self {
+        let c = tag.as_compound();
+        let count_list = |key: &str| -> u32 {
+            c.and_then(|c| c.get(key))
+                .and_then(|t| t.as_list())
+                .map(|(_, items)| items.len() as u32)
+                .unwrap_or(0)
+        };
+        let nbt_bytes = crate::nbt::write(tag).map(|b| b.len()).unwrap_or(0);
+
+        ChunkMeta {
+            x: cx,
+            z: cz,
+            rx: anvil::region_coord(cx),
+            rz: anvil::region_coord(cz),
+            sectors: 0,
+            nbt_bytes,
+            status: c
+                .and_then(|c| c.get("Status").or_else(|| c.get("status")))
+                .and_then(|t| t.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            data_version: c
+                .and_then(|c| c.get("DataVersion"))
+                .and_then(|t| t.as_i32())
+                .unwrap_or(0),
+            inhabited_time: c
+                .and_then(|c| c.get("InhabitedTime"))
+                .and_then(|t| t.as_i64())
+                .unwrap_or(0),
+            last_update: c
+                .and_then(|c| c.get("LastUpdate"))
+                .and_then(|t| t.as_i64())
+                .unwrap_or(0),
+            block_entities: count_list("block_entities"),
+            block_ticks: count_list("block_ticks"),
+            fluid_ticks: count_list("fluid_ticks"),
+            sections: count_list("sections"),
+        }
+    }
+
     pub fn is_full(&self) -> bool {
         self.status == "minecraft:full"
     }

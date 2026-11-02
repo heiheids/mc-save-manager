@@ -50,8 +50,30 @@ pub struct DimView {
     pub regions: Vec<mcworld_core::regions::Region>,
     /// 每个区块内的实体类型分布：区块坐标 → [(类型, 数量)]（按数量降序）。
     pub chunk_entity_types: std::collections::HashMap<(i32, i32), Vec<(String, usize)>>,
-    /// 是否已完成地图采样。
+    /// 是否已完成**初始**采样（出生点附近那一圈）。
     pub sampled: bool,
+
+    // ── 按视口增量加载 ──
+    //
+    // 早期实现是"打开存档就把所有区块采样一遍"，上万区块的存档要等十几秒。
+    // 现在改成：
+    //   - 打开时只采样出生点周围 INITIAL_RADIUS 圈
+    //   - 相机移动后，把**当前视野**内还没采样的区块排进队列
+    //   - 队列由后台线程逐批处理，UI 上显示"加载中"
+    //   - 已经采样过的区块留下纹理（缩略图），下次不再读盘
+    /// 已排队或正在加载的区块，防止重复提交。
+    pub pending: std::collections::HashSet<(i32, i32)>,
+    /// 上一次触发加载时的视口中心（区块坐标），用于判断"是否需要重新排队列"。
+    pub last_view_center: Option<(i32, i32)>,
+    /// 当前是否还有区块在加载（用于显示"加载中"）。
+    pub loading: bool,
+    /// 是否已完成一次全图（或大范围）加载。
+    pub full_loaded: bool,
+    /// 初始加载的展开阶段：
+    ///   0 = 还没开始
+    ///   1 = 首屏（FIRST_SCREEN_RADIUS）已完成，等待补齐到 INITIAL_RADIUS
+    ///   2 = 已补齐，之后完全交给视口加载
+    pub expand_stage: u8,
 }
 
 impl Default for DimView {
@@ -65,6 +87,11 @@ impl Default for DimView {
             regions: Vec::new(),
             chunk_entity_types: Default::default(),
             sampled: false,
+            pending: Default::default(),
+            last_view_center: None,
+            loading: false,
+            full_loaded: false,
+            expand_stage: 0,
         }
     }
 }
@@ -87,6 +114,8 @@ pub struct WorldTab {
 
     /// 每个维度各自的视图状态。切换维度只是换一份，不会丢掉已加载的内容。
     pub views: std::collections::HashMap<String, DimView>,
+    /// 悬停查询用的列缓存（按需从磁盘读，上限 64 个区块）。
+    pub column_cache: std::collections::HashMap<(i32, i32), Vec<mcworld_core::chunk::Column>>,
 
     pub current_dim: usize,
 
@@ -146,6 +175,7 @@ impl WorldTab {
             block_entities: Default::default(),
             current_dim: 0,
             views: Default::default(),
+        column_cache: Default::default(),
             edit_name,
             edit_seed,
             edit_spawn: spawn,
@@ -174,6 +204,46 @@ impl WorldTab {
     }
 
     /// 当前维度的视图状态（只读）。不存在时返回一个静态空值。
+    /// 按需取某区块某列的方块名与高度（鼠标悬停用）。
+    ///
+    /// 缩略图里不再保留 256 个 Column（那是原始区块数据，很占内存），
+    /// 所以悬停时要临时从磁盘读这一个区块。读到的结果放进一个小 LRU，
+    /// 避免鼠标在同一区块上移动时反复读盘。
+    pub fn column_on_demand(
+        &mut self,
+        cx: i32,
+        cz: i32,
+        lx: usize,
+        lz: usize,
+    ) -> Option<(String, i32)> {
+        // 缓存命中
+        if let Some(cols) = self.column_cache.get(&(cx, cz)) {
+            let col = cols.get(lz * 16 + lx)?;
+            if col.y < 0 {
+                return None;
+            }
+            return Some((col.block.clone(), col.y));
+        }
+
+        // 未命中：读这一个区块
+        let dim = self.dim().cloned()?;
+        let mode = mcworld_core::chunk::SliceMode::Surface;
+        let mut cache = mcworld_core::world::RegionCache::new(2);
+        let surf = self.world.chunk_surface(&dim, cx, cz, &mut cache, mode)?;
+
+        // 放进缓存（容量上限 64 个区块，约 0.5 MB）
+        if self.column_cache.len() >= 64 {
+            self.column_cache.clear();
+        }
+        self.column_cache.insert((cx, cz), surf.columns.clone());
+
+        let col = surf.columns.get(lz * 16 + lx)?;
+        if col.y < 0 {
+            return None;
+        }
+        Some((col.block.clone(), col.y))
+    }
+
     pub fn view(&self) -> &DimView {
         static EMPTY: std::sync::OnceLock<DimView> = std::sync::OnceLock::new();
         self.views
@@ -190,6 +260,11 @@ impl WorldTab {
     /// 确保某个维度的视图状态存在。
     pub fn ensure_view(&mut self, dim_id: &str) -> &mut DimView {
         self.views.entry(dim_id.to_string()).or_default()
+    }
+
+    /// 当前维度的区块总数。
+    pub fn chunk_count(&self) -> usize {
+        self.chunks_of_current().len()
     }
 
     pub fn chunks_of_current(&self) -> &[ChunkMeta] {
@@ -272,6 +347,8 @@ pub struct App {
     pub pending_confirm: Option<ConfirmAction>,
     /// 是否显示「关于」窗口。
     pub show_about: bool,
+    /// 「全图」确认后置位：下一帧强制按当前视口重新排队。
+    pub load_all_pending: bool,
     /// 上一帧的窗口尺寸；变化时强制重绘几帧，规避 glow 后端偶发白屏。
     pub last_size: egui::Vec2,
     /// 还需要强制重绘的帧数。
@@ -370,6 +447,8 @@ pub enum ConfirmAction {
         target: (i32, i32),
     },
     SaveLevel,
+    /// 全图加载：区块很多时会读取很久，先让用户确认。
+    LoadAll { chunks: usize },
 }
 
 impl Default for App {
@@ -400,6 +479,7 @@ impl Default for App {
             autosave_delay: 0.0,
             pending_confirm: None,
             show_about: false,
+            load_all_pending: false,
             last_size: egui::Vec2::ZERO,
             repaint_frames: 3,
         }
@@ -499,23 +579,154 @@ impl App {
         self.request_scan();
     }
 
+    /// 打开存档时的初始加载半径（单位：区块）。
+    ///
+    /// 实测（1.21.1 存档，10317 区块）单区块采样约 5.7 ms，
+    /// 半径 20 就是 1681 个区块 ≈ 9.6 秒 —— 用户明确要求"默认只加载
+    /// 出生点半径 20 区块位置"，所以这里保持 20，但**分批提交**，
+    /// 首屏先用小的 R首屏 半径快速出图，剩下的在后台补齐。
+    pub const INITIAL_RADIUS: i32 = 20;
+
+    /// 首屏优先半径：小于 INITIAL_RADIUS。
+    ///
+    /// 打开存档后先只排这一圈（约 121 个区块 ≈ 0.7 秒），
+    /// 让地图立刻有内容；随后再补齐到 INITIAL_RADIUS。
+    pub const FIRST_SCREEN_RADIUS: i32 = 5;
+
+    /// 拖动时按视口加载的外扩余量（单位：区块）。
+    ///
+    /// 比视口多加载一圈，这样小幅拖动时不用等加载。
+    pub const VIEW_MARGIN: i32 = 2;
+
+    /// 计算"当前需要显示的区块范围"（区块坐标闭区间）。
+    ///
+    /// `viewport` 是地图画布的像素矩形，相机 `scale` 是每方块像素数，
+    /// 所以可见方块宽 = viewport.width / scale，再除以 16 得到区块数。
+    fn visible_chunk_range(
+        cam: &map_view::MapCamera,
+        viewport: egui::Rect,
+        margin: i32,
+    ) -> (i32, i32, i32, i32) {
+        let half_w = (viewport.width() / 2.0) / cam.scale.max(0.01);
+        let half_h = (viewport.height() / 2.0) / cam.scale.max(0.01);
+
+        let min_bx = cam.center.x - half_w;
+        let max_bx = cam.center.x + half_w;
+        let min_bz = cam.center.y - half_h;
+        let max_bz = cam.center.y + half_h;
+
+        let cx0 = (min_bx / 16.0).floor() as i32 - margin;
+        let cz0 = (min_bz / 16.0).floor() as i32 - margin;
+        let cx1 = (max_bx / 16.0).floor() as i32 + margin;
+        let cz1 = (max_bz / 16.0).floor() as i32 + margin;
+        (cx0, cz0, cx1, cz1)
+    }
+
+    /// 按当前视口，把**尚未采样**的区块排进加载队列。
+    ///
+    /// `viewport` 为 `None` 时（还没画过地图）退回"出生点 INITIAL_RADIUS 圈"。
+    ///
+    /// 已经被采样过的区块只存在于 `DimView::map`（缩略图纹理）里，
+    /// 原始区块数据早就释放了，所以这里只需要查纹理缓存就能判断"要不要加载"。
+    pub fn request_viewport_sample(&mut self, viewport: Option<egui::Rect>) {
+        self.request_viewport_sample_r(viewport, Self::INITIAL_RADIUS);
+    }
+
+    /// 同 `request_viewport_sample`，但可指定出生点半径。
+    ///
+    /// `radius` 只在 viewport 为 None（还没画布）时生效。
+    pub fn request_viewport_sample_r(&mut self, viewport: Option<egui::Rect>, radius: i32) {
+        let mode = self.slice_mode();
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
+
+        // 先取需要的字段，避免和后面的可变借用打架
+        let dim = match tab.dim().cloned() {
+            Some(d) => d,
+            None => return,
+        };
+
+        let (cx0, cz0, cx1, cz1) = match viewport {
+            Some(vp) => Self::visible_chunk_range(&tab.view().camera, vp, Self::VIEW_MARGIN),
+            None => {
+                // 还没有画布尺寸：用出生点附近的固定圈
+                let (sx, _sy, sz) = tab.world.level.spawn();
+                let scx = (sx as f32 / 16.0).floor() as i32;
+                let scz = (sz as f32 / 16.0).floor() as i32;
+                let r = radius;
+                (scx - r, scz - r, scx + r, scz + r)
+            }
+        };
+
+        // 收集需要加载的区块。
+        //
+        // ★ 遍历**区块索引**而不是矩形范围：
+        //   全图缩放下视口矩形可能有上亿个格点，但其中绝大多数根本没有区块。
+        //   按矩形遍历既慢，又会被"超过 4096 就放弃"的保护逻辑拦住 ——
+        //   那样"全图"按钮就完全没用了。
+        //   索引里只有真实存在的区块，按范围过滤后数量可控。
+        let mut need: Vec<(i32, i32)> = Vec::new();
+        {
+            let v = tab.view();
+            for c in tab.chunks_of_current() {
+                if c.x < cx0 || c.x > cx1 || c.z < cz0 || c.z > cz1 {
+                    continue;
+                }
+                let key = (c.x, c.z);
+                if v.map.contains(key) || v.pending.contains(&key) {
+                    continue;
+                }
+                need.push(key);
+            }
+        }
+
+        // 单次提交上限：避免一次把上万个区块塞给后台线程，
+        // 导致这一帧卡住。剩下的下一帧会继续补，表现为"分批出现"。
+        const MAX_PER_BATCH: usize = 1024;
+        if need.len() > MAX_PER_BATCH {
+            need.truncate(MAX_PER_BATCH);
+        }
+
+        if need.is_empty() {
+            // 没有新东西要加载：如果队列已空，清掉 loading 标记
+            if tab.view().pending.is_empty() {
+                tab.view_mut().loading = false;
+            }
+            return;
+        }
+
+        // 记入 pending，防止重复提交
+        {
+            let v = tab.view_mut();
+            for k in &need {
+                v.pending.insert(*k);
+            }
+            v.loading = true;
+        }
+
+        let root = tab.path.clone();
+        self.jobs.spawn_sample(root, dim, need, mode);
+    }
+
     /// 为当前维度启动地图采样。
     ///
     /// 每个维度的采样状态独立记录在 `DimView::sampled` 里，
     /// 切走再切回来不会重复采样，也不会因为清空而丢失已渲染的地图。
     pub fn request_sample(&mut self) {
         let Some(tab) = self.tabs.get(self.active) else { return };
+        // 已经做过初始加载就不再重复
         if tab.view().sampled {
             return;
         }
-        let chunks: Vec<(i32, i32)> = tab.chunks_of_current().iter().map(|c| (c.x, c.z)).collect();
-        if chunks.is_empty() {
+        if tab.chunks_of_current().is_empty() {
             return;
         }
-        let Some(dim) = tab.dim().cloned() else { return };
-        let root = tab.path.clone();
-        let mode = self.slice_mode();
-        self.jobs.spawn_sample(root, dim, chunks, mode);
+        // 打开存档时只加载出生点周围一圈，不再全量采样。
+        //
+        // 这里刻意用**更小的** FIRST_SCREEN_RADIUS 先出图：
+        // 实测 1.21.1 存档单区块采样 5.7 ms，半径 20 要 9.6 秒才出第一张图，
+        // 用户会以为程序卡死。半径 5 只要约 0.7 秒。
+        // 补齐到 INITIAL_RADIUS（以及更远）由视口加载在后续帧自动完成。
+        self.request_viewport_sample_r(None, Self::FIRST_SCREEN_RADIUS);
     }
 
     /// 当前有效的切片方式（自定义高度优先，否则按维度默认）。
@@ -613,17 +824,56 @@ impl App {
                     );
                     self.request_sample();
                 }
-                JobResult::Sampled { dimension, surfaces, complete } => {
+                JobResult::ScannedRange { dimension, chunks } => {
                     if let Some(tab) = self.tab_mut() {
-                        // 纹理写进该维度自己的缓存；即使当前已切到别的维度也能正常保存
+                        // 把重扫到的区块并回索引（按坐标去重）
+                        let list = tab.chunks.entry(dimension.clone()).or_default();
+                        list.retain(|c| {
+                            !chunks.iter().any(|n| n.x == c.x && n.z == c.z)
+                        });
+                        list.extend(chunks.clone());
+                        list.sort_unstable_by_key(|c| (c.z, c.x));
+                    }
+                    // 重新排队采样（纹理已被 drop_range 清掉）
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        tab.view_mut().last_view_center = None;
+                    }
+                }
+                JobResult::Sampled { dimension, surfaces, missing, complete } => {
+                    let loaded = surfaces.len();
+                    if let Some(tab) = self.tab_mut() {
+                        // 纹理写进该维度自己的缓存；即使当前已切到别的维度也能正常保存。
+                        // 写完纹理就不再需要原始区块数据了，chunk_surface 返回的
+                        // ChunkSurface 在下一批里自然释放 —— 这就是"缩略图化"。
                         let v = tab.ensure_view(&dimension);
                         for s in &surfaces {
+                            let key = (s.x, s.z);
                             v.map.insert(ctx, s);
+                            v.pending.remove(&key);
+                        }
+                        // 无数据的区块也要从 pending 里移走，
+                        // 否则"加载中"会一直显示下去。
+                        for key in &missing {
+                            v.pending.remove(key);
+                            v.map.mark_missing(*key);
                         }
                         if complete {
                             v.sampled = true;
+                            // 首屏那一圈做完了 → 进入"补齐到 INITIAL_RADIUS"阶段。
+                            // 不能直接跳到 2，否则半径 20 那圈永远补不上。
+                            if v.expand_stage == 0 {
+                                v.expand_stage = 1;
+                            } else {
+                                v.expand_stage = 2;
+                            }
+                        }
+                        // 只要队列空了就撤掉"加载中"，不必等 complete：
+                        // 中途可能有新批次插进来，死等 complete 会让提示卡住。
+                        if v.pending.is_empty() {
+                            v.loading = false;
                         }
                     }
+                    let _ = loaded;
                 }
                 JobResult::EntitiesDeleted { stats, dimension } => {
                     self.set_status(
@@ -640,13 +890,15 @@ impl App {
                     count,
                     message,
                     backup_dir,
+                    bounds,
                 } => {
                     self.last_backup = Some(mcworld_core::safety::LastBackup {
                         dir: backup_dir,
                         label: format!("删除 {count} 个区块"),
                     });
                     self.set_status(message, StatusKind::Success);
-                    self.refresh_current();
+                    // 只刷新被删区域 + 周边 5 区块，不再全图重扫。
+                    self.refresh_region(bounds.0, bounds.1, bounds.2, bounds.3);
                 }
                 JobResult::Copied(cb) => {
                     let (n, be, en) = (cb.chunk_count(), cb.block_entities, cb.entities);
@@ -689,6 +941,51 @@ impl App {
     }
 
     /// 重新扫描当前维度（写操作后）。
+    /// 局部刷新：只重扫指定区块范围（外扩 `REFRESH_MARGIN` 圈）。
+    ///
+    /// 删除区块后调用。相比 `refresh_current`（整体作废 + 全量重扫），
+    /// 这里只做三件事：
+    ///   1. 从区块索引里移除该范围内的条目
+    ///   2. 丢弃该范围内的缩略图纹理，让它们重新排队采样
+    ///   3. 重新扫描该范围（携带邻域，因为区块边界可能互相影响）
+    ///
+    /// 地图其余部分完全不动，避免大存档删几个区块就卡全图。
+    pub fn refresh_region(&mut self, x0: i32, z0: i32, x1: i32, z1: i32) {
+        const REFRESH_MARGIN: i32 = 5;
+
+        let (rx0, rz0) = (x0 - REFRESH_MARGIN, z0 - REFRESH_MARGIN);
+        let (rx1, rz1) = (x1 + REFRESH_MARGIN, z1 + REFRESH_MARGIN);
+
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let dim_id = tab.dim_id();
+
+        // (1) 从索引里去掉该范围
+        if let Some(list) = tab.chunks.get_mut(&dim_id) {
+            list.retain(|c| !(c.x >= rx0 && c.x <= rx1 && c.z >= rz0 && c.z <= rz1));
+        }
+
+        // (2) 丢弃该范围的缩略图 + pending，让它们重新排队
+        {
+            let v = tab.ensure_view(&dim_id);
+            v.map.drop_range(rx0, rz0, rx1, rz1);
+            v.pending.retain(|(cx, cz)| {
+                !(*cx >= rx0 && *cx <= rx1 && *cz >= rz0 && *cz <= rz1)
+            });
+            // 强制下一帧重新计算视口，把这块补回来
+            v.last_view_center = None;
+        }
+
+        // (3) 后台重扫该范围
+        let dim = match tab.dim().cloned() {
+            Some(d) => d,
+            None => return,
+        };
+        let root = tab.path.clone();
+        self.jobs.spawn_scan_range(root, dim, rx0, rz0, rx1, rz1);
+    }
+
     fn refresh_current(&mut self) {
         if let Some(tab) = self.tab_mut() {
             tab.invalidate();
@@ -728,6 +1025,35 @@ impl eframe::App for App {
                 self.repaint_frames -= 1;
             }
             ctx.request_repaint();
+        }
+
+        // 初始加载的展开阶段：
+        //   阶段 1 → 把半径补齐到 INITIAL_RADIUS（首屏只做过半径 5）
+        //   阶段 2 → 之后完全交给视口加载，不再主动补
+        {
+            let stage = self
+                .tab()
+                .map(|t| t.view().expand_stage)
+                .unwrap_or(0);
+            let busy = self
+                .tab()
+                .map(|t| t.view().loading || !t.view().pending.is_empty())
+                .unwrap_or(false);
+            if stage == 1 && !busy {
+                // 首屏已完成且当前没有在跑的任务 → 补半径 20 那一圈
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.view_mut().loading = true;
+                }
+                self.request_viewport_sample_r(None, Self::INITIAL_RADIUS);
+            }
+        }
+
+        // 「全图」确认后：强制下一帧按视口重新排队
+        if self.load_all_pending {
+            self.load_all_pending = false;
+            // 视口加载在 map_area 里做，这里只需要确保标记被清掉、
+            // 并且立刻请求一次补加载。
+            self.request_viewport_sample(None);
         }
 
         // 重载存档请求

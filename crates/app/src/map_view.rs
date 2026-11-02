@@ -16,7 +16,15 @@ use crate::theme;
 /// 一张区块缩略图纹理。
 pub struct ChunkTile {
     pub texture: TextureHandle,
-    /// 保留 256 列采样结果，供鼠标悬停查询方块与高度。
+    /// 采样列数据，供鼠标悬停查询方块与高度。
+    ///
+    /// **默认不保留**：这是"缩略图化"的关键。
+    /// 256 个 Column 每个都带一个 String（方块名），一个区块大约 8-12 KB。
+    /// 上万区块就是上百 MB —— 而且这些数据本来就已经烘焙进纹理了，
+    /// 纹理才是真正需要的"缩略图"。
+    ///
+    /// 只有在需要精确查询（悬停提示）时，才从存档重新读这一个区块。
+    /// 这样地图滚动时不会因为保留原始数据而越来越卡。
     pub columns: Vec<Column>,
 }
 
@@ -62,45 +70,35 @@ impl TileCache {
             img,
             TextureOptions::NEAREST,
         );
+        // 只保留纹理。columns 在这里刻意丢弃 ——
+        // 它是"原始区块数据"，而纹理已经是它的缩略图。
+        // 需要细节时按需从磁盘重读（见 hover 查询）。
         self.tiles.insert(
             (surface.x, surface.z),
             ChunkTile {
                 texture: tex,
-                columns: surface.columns.clone(),
+                columns: Vec::new(),
             },
         );
+    }
+
+    /// 丢弃某个区块范围内的缩略图与"无数据"标记。
+    ///
+    /// 删除 / 粘贴区块后调用：这块内容变了，纹理需要重新采样。
+    /// 范围是闭区间（区块坐标）。
+    pub fn drop_range(&mut self, x0: i32, z0: i32, x1: i32, z1: i32) {
+        self.tiles.retain(|(cx, cz), _| {
+            !(*cx >= x0 && *cx <= x1 && *cz >= z0 && *cz <= z1)
+        });
+        self.missing.retain(|(cx, cz)| {
+            !(*cx >= x0 && *cx <= x1 && *cz >= z0 && *cz <= z1)
+        });
     }
 
     pub fn get(&self, key: (i32, i32)) -> Option<&ChunkTile> {
         self.tiles.get(&key)
     }
 
-    /// 取某块某列采样到的方块名与高度（用于鼠标悬停提示）。
-    pub fn surface_block(
-        &self,
-        cx: i32,
-        cz: i32,
-        lx: usize,
-        lz: usize,
-    ) -> Option<(String, i32)> {
-        let t = self.tiles.get(&(cx, cz))?;
-        let col = t.columns.get(lz * 16 + lx)?;
-        if col.y < 0 {
-            return None;
-        }
-        Some((col.block.clone(), col.y))
-    }
-
-    /// 取某块某列采样到的高度。
-    pub fn surface_y(&self, cx: i32, cz: i32, lx: usize, lz: usize) -> Option<i32> {
-        let t = self.tiles.get(&(cx, cz))?;
-        let col = t.columns.get(lz * 16 + lx)?;
-        if col.y < 0 {
-            None
-        } else {
-            Some(col.y)
-        }
-    }
 
     pub fn clear(&mut self) {
         self.tiles.clear();

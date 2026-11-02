@@ -25,10 +25,20 @@ pub enum JobResult {
         block_entity_count: usize,
         block_entity_types: Vec<(String, usize)>,
     },
+    /// 局部重扫完成（删除 / 粘贴后的范围刷新）
+    ScannedRange {
+        dimension: String,
+        chunks: Vec<ChunkMeta>,
+    },
     /// 地图采样完成一批
     Sampled {
         dimension: String,
         surfaces: Vec<mcworld_core::ChunkSurface>,
+        /// 本批里"查不到数据"的区块坐标。
+        ///
+        /// 必须上报，否则它们会永远留在 pending 里，
+        /// 导致"加载中"提示一直不消失。
+        missing: Vec<(i32, i32)>,
         complete: bool,
     },
     /// 删除实体完成
@@ -39,6 +49,9 @@ pub enum JobResult {
         message: String,
         /// 本次操作的备份目录（用于撤销）。
         backup_dir: std::path::PathBuf,
+        /// 本次删除覆盖的区块范围（多个选区的并集，已归一化）。
+        /// 用于只刷新这一块 + 周边，而不是重扫整个维度。
+        bounds: (i32, i32, i32, i32),
     },
     /// 复制完成
     Copied(ChunkClipboard),
@@ -212,6 +225,87 @@ impl Jobs {
     }
 
     /// 启动地图采样任务（分批返回，界面可以渐进更新）。
+    /// 只扫描指定区块范围（闭区间），用于删除后的局部刷新。
+    ///
+    /// 与 `spawn_scan` 的区别：不遍历整个 region 文件，
+    /// 只按坐标逐个读需要的区块。范围通常很小（几十个区块），
+    /// 所以比全量扫描快得多。
+    pub fn spawn_scan_range(
+        &mut self,
+        world_root: PathBuf,
+        dim: Dimension,
+        x0: i32,
+        z0: i32,
+        x1: i32,
+        z1: i32,
+    ) {
+        let (tx, rx) = channel();
+        let id = self.next_id;
+        self.next_id += 1;
+        let label = format!("刷新 {} 个区块", (x1 - x0 + 1) * (z1 - z0 + 1));
+
+        std::thread::spawn(move || {
+            let result = (|| -> Result<(), String> {
+                let world = World::open(&world_root).map_err(|e| e.to_string())?;
+                let dim = world
+                    .dimensions
+                    .iter()
+                    .find(|d| d.id == dim.id)
+                    .cloned()
+                    .unwrap_or(dim);
+
+                let base = dim.dir(RegionKind::Terrain);
+                let mut fresh: Vec<ChunkMeta> = Vec::new();
+                // 缓存已打开的 region，避免同一文件反复开
+                let mut open: std::collections::HashMap<(i32, i32), mcworld_core::anvil::RegionFile> =
+                    Default::default();
+
+                for cz in z0..=z1 {
+                    for cx in x0..=x1 {
+                        let (rx, rz) = (
+                            mcworld_core::anvil::region_coord(cx),
+                            mcworld_core::anvil::region_coord(cz),
+                        );
+                        let path = base.join(mcworld_core::anvil::region_file_name(rx, rz));
+                        if !path.exists() {
+                            continue;
+                        }
+                        if !open.contains_key(&(rx, rz)) {
+                            match mcworld_core::anvil::RegionFile::open(&path) {
+                                Ok(f) => {
+                                    open.insert((rx, rz), f);
+                                }
+                                Err(_) => continue,
+                            }
+                        }
+                        let Some(rf) = open.get_mut(&(rx, rz)) else { continue };
+                        if let Ok(Some(tag)) = rf.chunk(cx, cz) {
+                            fresh.push(ChunkMeta::from_tag(cx, cz, &tag));
+                        }
+                    }
+                }
+
+                let _ = tx.send(JobResult::ScannedRange {
+                    dimension: dim.id.clone(),
+                    chunks: fresh,
+                });
+                Ok(())
+            })();
+
+            if let Err(e) = result {
+                let _ = tx.send(JobResult::Failed(e));
+            }
+        });
+
+        self.jobs.push(Job {
+            id,
+            rx,
+            progress: Progress::default(),
+            label,
+            finished: false,
+        });
+    }
+
     pub fn spawn_sample(
         &mut self,
         world_root: PathBuf,
@@ -237,17 +331,20 @@ impl Jobs {
                 let mut cache = mcworld_core::world::RegionCache::new(64);
                 let total = chunks.len();
                 let mut batch = Vec::with_capacity(256);
+                let mut miss_batch: Vec<(i32, i32)> = Vec::new();
 
                 for (i, (cx, cz)) in chunks.into_iter().enumerate() {
                     match world.chunk_surface(&dim, cx, cz, &mut cache, mode) {
                         Some(s) => batch.push(s),
-                        None => {}
+                        // 记录无数据的区块，供前端清理 pending
+                        None => miss_batch.push((cx, cz)),
                     }
-                    if batch.len() >= 128 || i + 1 == total {
+                    if batch.len() >= 128 || miss_batch.len() >= 256 || i + 1 == total {
                         let complete = i + 1 == total;
                         let _ = tx.send(JobResult::Sampled {
                             dimension: dim.id.clone(),
                             surfaces: std::mem::take(&mut batch),
+                            missing: std::mem::take(&mut miss_batch),
                             complete,
                         });
                         let _ = ptx.send((
@@ -418,6 +515,18 @@ impl Jobs {
                 editor.commit(&mut session).map_err(|e| e.to_string())?;
                 session.mark_committed();
 
+                // 算出本次覆盖的范围（用于局部刷新）
+                let mut bmin_x = i32::MAX;
+                let mut bmax_x = i32::MIN;
+                let mut bmin_z = i32::MAX;
+                let mut bmax_z = i32::MIN;
+                for (cx, cz) in &chunks {
+                    bmin_x = bmin_x.min(*cx);
+                    bmax_x = bmax_x.max(*cx);
+                    bmin_z = bmin_z.min(*cz);
+                    bmax_z = bmax_z.max(*cz);
+                }
+
                 let _ = tx.send(JobResult::ChunksDeleted {
                     count: removed,
                     message: format!(
@@ -426,6 +535,7 @@ impl Jobs {
                         backup_dir.display()
                     ),
                     backup_dir: backup_dir.clone(),
+                    bounds: (bmin_x, bmin_z, bmax_x, bmax_z),
                 });
                 Ok(())
             })();

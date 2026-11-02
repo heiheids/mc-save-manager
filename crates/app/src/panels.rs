@@ -1041,6 +1041,12 @@ pub fn map_area(app: &mut App, ctx: &egui::Context) {
     // 加载提示的剩余时间，绘制完地图后叠在画布上
     let hint_left = app.hint_remaining;
     let mut show_about = false;
+    // 本帧是否需要为视口补加载区块
+    let mut viewport_needs_load = false;
+    // 本帧点了「全图」，需要弹确认框（区块数）
+    let mut pending_load_all: Option<usize> = None;
+    // 本帧的地图画布矩形（用于视口计算）
+    let mut map_viewport: Option<egui::Rect> = None;
     let mut paste_done = false;
     let mut paste_cancelled = false;
 
@@ -1175,8 +1181,15 @@ pub fn map_area(app: &mut App, ctx: &egui::Context) {
                             v.camera.scale = 1.5;
                         }
                     }
-                    if ui.small_button("全图").clicked() {
+                    if ui
+                        .small_button("全图")
+                        .on_hover_text("缩放到能看见全部区块（会按需加载，可能较慢）")
+                        .clicked()
+                    {
                         fit_all(tab);
+                        // 全图之后视口会覆盖整张地图，需要确认是否真的加载
+                        let n = tab.chunk_count();
+                        pending_load_all = Some(n);
                     }
                     ui.label(
                         RichText::new(format!("{:.2}×", tab.view().camera.scale))
@@ -1249,6 +1262,9 @@ pub fn map_area(app: &mut App, ctx: &egui::Context) {
                 confirmed,
             };
 
+            // 记录地图画布在本帧的像素矩形，供"按视口加载区块"使用。
+            map_viewport = Some(ui.available_rect_before_wrap());
+
             let Some(tab) = app.tabs.get_mut(app.active) else { return };
             // 同一个 DimView 里同时读 map、写 camera/selection：
             // 先取出一次可变引用，再拆成字段借用，避免重复借用冲突。
@@ -1262,6 +1278,63 @@ pub fn map_area(app: &mut App, ctx: &egui::Context) {
                 spawn,
                 opts,
             );
+
+            // ---- "加载中"提示（画在画布右上角）----
+            {
+                let loading = v.loading;
+                let pending_n = v.pending.len();
+                if loading && pending_n > 0 {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(150));
+                    let painter = ui.painter();
+                    let vp = ui.max_rect();
+                    let text = format!("加载中…  剩余 {pending_n} 个区块");
+                    let galley = painter.layout_no_wrap(
+                        text,
+                        egui::FontId::proportional(13.0),
+                        Color32::from_rgba_unmultiplied(0xFF, 0xE8, 0xB0, 235),
+                    );
+                    let pad = Vec2::new(12.0, 7.0);
+                    let sz = galley.size() + pad * 2.0;
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(vp.right() - sz.x - 14.0, vp.top() + 14.0),
+                        sz,
+                    );
+                    painter.rect_filled(
+                        rect,
+                        6.0,
+                        Color32::from_rgba_unmultiplied(0x2A, 0x24, 0x18, 225),
+                    );
+                    painter.rect_stroke(
+                        rect,
+                        6.0,
+                        egui::Stroke::new(
+                            1.0,
+                            Color32::from_rgba_unmultiplied(0xC8, 0xA8, 0x60, 220),
+                        ),
+                        egui::StrokeKind::Middle,
+                    );
+                    painter.galley(rect.min + pad, galley, Color32::WHITE);
+                }
+            }
+
+            // 相机被拖动 / 缩放后，把视野内还没采样的区块排进队列。
+            // 只在中心移动超过 2 个区块时才重新计算，避免每帧遍历。
+            {
+                let cam_center = v.camera.center;
+                let cur = (
+                    (cam_center.x / 16.0).floor() as i32,
+                    (cam_center.y / 16.0).floor() as i32,
+                );
+                let moved = match v.last_view_center {
+                    Some(prev) => (prev.0 - cur.0).abs() >= 2 || (prev.1 - cur.1).abs() >= 2,
+                    None => true,
+                };
+                if moved {
+                    v.last_view_center = Some(cur);
+                    viewport_needs_load = true;
+                }
+            }
 
             // 粘贴定位：左键确认 → 弹出确认框；右键取消
             if let Some((ax, az)) = resp.paste_confirm {
@@ -1367,23 +1440,37 @@ pub fn map_area(app: &mut App, ctx: &egui::Context) {
         if show_about {
             app.show_about = true;
         }
+        if let Some(n) = pending_load_all {
+            app.pending_confirm = Some(ConfirmAction::LoadAll { chunks: n });
+        }
+
+        // 视口内还有没采样的区块 → 排进后台队列。
+        // 这里放在绘制之后，拿到的 viewport 才是本帧真实尺寸。
+        if viewport_needs_load {
+            app.request_viewport_sample(map_viewport);
+        }
 }
 
 fn fit_all(tab: &mut WorldTab) {
-    let chunks = tab.chunks_of_current();
-    if chunks.is_empty() {
-        return;
-    }
-    let mut min_x = i32::MAX;
-    let mut max_x = i32::MIN;
-    let mut min_z = i32::MAX;
-    let mut max_z = i32::MIN;
-    for c in chunks {
-        min_x = min_x.min(c.x);
-        max_x = max_x.max(c.x);
-        min_z = min_z.min(c.z);
-        max_z = max_z.max(c.z);
-    }
+    // 先算范围（借用不可变），再改相机（借用可变）——
+    // 不能边持有 chunks 切片边 view_mut()。
+    let (min_x, max_x, min_z, max_z) = {
+        let chunks = tab.chunks_of_current();
+        if chunks.is_empty() {
+            return;
+        }
+        let mut min_x = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut min_z = i32::MAX;
+        let mut max_z = i32::MIN;
+        for c in chunks {
+            min_x = min_x.min(c.x);
+            max_x = max_x.max(c.x);
+            min_z = min_z.min(c.z);
+            max_z = max_z.max(c.z);
+        }
+        (min_x, max_x, min_z, max_z)
+    };
     let cx = (min_x + max_x) as f32 * 8.0 + 8.0;
     let cz = (min_z + max_z) as f32 * 8.0 + 8.0;
     let span = ((max_x - min_x).max(max_z - min_z) as f32 * 16.0).max(32.0);
@@ -1459,35 +1546,32 @@ pub fn status_bar(app: &mut App, ctx: &egui::Context) {
 }
 
 /// 补全悬停信息里的方块与群系（按当前维度与渲染高度取）。
-fn lookup_hover(app: &App, info: &crate::HoverInfo) -> Option<crate::HoverInfo> {
-    let tab = app.tab()?;
+fn lookup_hover(app: &mut App, info: &crate::HoverInfo) -> Option<crate::HoverInfo> {
+    let mode = app.slice_mode();
+    let (lx, lz) = (
+        info.x.rem_euclid(16) as usize,
+        info.z.rem_euclid(16) as usize,
+    );
+    let (cx, cz) = (info.chunk_x, info.chunk_z);
+
+    // 方块名与高度：按需从磁盘读这一个区块。
+    // 缩略图里不再保留 256 列原始数据（那是"卸载区块数据"的关键），
+    // 所以这里查一次、缓存一次，鼠标在同一区块里移动不会重复读盘。
+    let tab = app.tab_mut()?;
+    let hit = tab.column_on_demand(cx, cz, lx, lz);
     let dim = tab.dim()?.clone();
-    let y = match app.slice_mode() {
-        mcworld_core::chunk::SliceMode::Fixed(v) => v,
-        mcworld_core::chunk::SliceMode::Surface => {
-            // 用该列实际采样到的高度；没有就退回 64
-            let (cx, cz) = (info.chunk_x, info.chunk_z);
-            let lx = info.x.rem_euclid(16) as usize;
-            let lz = info.z.rem_euclid(16) as usize;
-            tab.view()
-                .map
-                .surface_y(cx, cz, lx, lz)
-                .unwrap_or(64)
-        }
+
+    let (block, block_y) = match hit {
+        Some((b, by)) => (Some(b), by),
+        None => (None, match mode {
+            mcworld_core::chunk::SliceMode::Fixed(v) => v,
+            mcworld_core::chunk::SliceMode::Surface => 64,
+        }),
     };
 
-    // 群系：仅在区块变化时读取（这里用固定的小缓存由 World 内部 RegionCache 承担）
+    // 群系
     let mut cache = mcworld_core::world::RegionCache::new(2);
-    let biome = tab.world.biome_at(&dim, info.x, y, info.z, &mut cache);
-
-    // 方块名：从已采样的 column 里取（便宜）
-    let (lx, lz) = (info.x.rem_euclid(16) as usize, info.z.rem_euclid(16) as usize);
-    let (block, block_y) = tab
-        .view()
-        .map
-        .surface_block(info.chunk_x, info.chunk_z, lx, lz)
-        .map(|(b, by)| (Some(b), by))
-        .unwrap_or((None, y));
+    let biome = tab.world.biome_at(&dim, info.x, block_y, info.z, &mut cache);
 
     Some(crate::HoverInfo {
         x: info.x,
@@ -1680,6 +1764,16 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
                 "确认粘贴".to_string(),
                 format!("将把剪贴板中的 {count} 个区块粘贴到 {dim}，覆盖原有区块。\n\n操作前会自动备份。"),
             ),
+            ConfirmAction::LoadAll { chunks } => (
+                "确认加载全图".to_string(),
+                format!(
+                    "如果世界已加载区块较多，会用很多时间读取，请等待。\n\n\
+                     当前维度共 {chunks} 个区块。\n\n\
+                     缩放比例会先跳到全图视野，区块将在后台逐个采样，\n\
+                     地图上会逐步出现内容。\n\n\
+                     已加载过的区块会保留缩略图，不会重复读盘。"
+                ),
+            ),
             ConfirmAction::SaveLevel => (
                 "确认保存 level.dat".to_string(),
                 "将把左侧表单的修改写入 level.dat。\n原文件会先备份为 level.dat_old。".to_string(),
@@ -1727,6 +1821,22 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
 
 fn execute_confirmed(app: &mut App, action: ConfirmAction) {
     match action {
+        ConfirmAction::LoadAll { .. } => {
+            // 用户已确认：把所有视口都会覆盖到的区块排进队列。
+            // 具体做法是把相机缩到全图后，由常规的视口加载逻辑接管 ——
+            // 它会按视野逐个补，而不是一次性提交上万个区块。
+            app.set_status(
+                "正在加载全图区块，请稍候…（已加载过的会跳过）",
+                StatusKind::Info,
+            );
+            // 清掉 last_view_center，强制下一帧重新计算视口
+            if let Some(tab) = app.tabs.get_mut(app.active) {
+                let v = tab.view_mut();
+                v.last_view_center = None;
+                v.full_loaded = true;
+            }
+            app.load_all_pending = true;
+        }
         ConfirmAction::SaveLevel => {
             let Some(tab) = app.tabs.get_mut(app.active) else { return };
             let label = format!("修改 level.dat（{}）", tab.edit_name);
