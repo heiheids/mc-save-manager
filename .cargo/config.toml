@@ -1,4 +1,16 @@
-﻿# 本机构建配置（不提交到 Git）。
+# 构建配置（跨平台，提交到 Git）。
+#
+# 这里**只放与机器无关的设置**。不要把本机绝对路径、平台专属链接参数
+# 写进这个文件 —— 它会被 CI 和其它开发者克隆到各种环境里。
+#
+# 【本机专属配置怎么做】
+# 官方支持的方式是命令行覆盖，优先级高于本文件：
+#
+#   cargo build --config .cargo/config.local.toml
+#
+# 或者设置环境变量 CARGO_HOME / 在 ~/.cargo/config.toml 里写。
+# 见 .cargo/config.local.toml.example 的说明。
+
 [source.crates-io]
 replace-with = "rsproxy"
 
@@ -7,15 +19,3 @@ registry = "sparse+https://rsproxy.cn/index/"
 
 [net]
 retry = 5
-
-[target.x86_64-pc-windows-gnullvm]
-linker = ".toolchain/rustup/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu/bin/rust-lld.exe"
-rustflags = [
-  "-C", "linker-flavor=ld.lld",
-  "-C", "link-self-contained=yes",
-  "-C", "link-arg=-L.toolchain/rustup/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu/lib/self-contained",
-  "-C", "link-arg=-L.toolchain/rustup/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnullvm/lib",
-  "-C", "link-arg=.toolchain/rustup/toolchains/stable-x86_64-pc-windows-gnu/lib/rustlib/x86_64-pc-windows-gnu/lib/self-contained/libgcc_eh.a",
-  "-C", "link-arg=--subsystem", "-C", "link-arg=windows",
-  "-C", "link-arg=crates/app/assets/icon_obj.obj",
-]

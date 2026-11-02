@@ -10,3 +10,9 @@ flate2 = "1"
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame", "safe-encode", "safe-decode"] }
 indexmap = "2"
 thiserror = "1"
+
+# 仅 Unix 需要：用 fcntl 探测 session.lock 的记录锁。
+# Java 的 FileChannel.tryLock() 用的就是 POSIX 记录锁，
+# 必须用同一套机制才能正确判断存档是否被游戏占用。
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

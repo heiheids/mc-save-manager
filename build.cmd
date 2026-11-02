@@ -29,10 +29,15 @@ set RUSTUP_TOOLCHAIN=stable-x86_64-pc-windows-gnu
 set CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER=%TC%\rustup\toolchains\stable-x86_64-pc-windows-gnu\lib\rustlib\x86_64-pc-windows-gnu\bin\rust-lld.exe
 
 pushd "%ROOT%"
+REM Local linker flags live in .cargo/config.local.toml (not in git).
+REM Use --config to layer them on top of the repo .cargo/config.toml.
+set LOCALCFG=
+if exist "%ROOT%.cargo\config.local.toml" set LOCALCFG=--config "%ROOT%.cargo\config.local.toml"
+
 if "%~1"=="" (
-    cargo build --target x86_64-pc-windows-gnullvm
+    cargo build %LOCALCFG% --target x86_64-pc-windows-gnullvm
 ) else (
-    cargo %* --target x86_64-pc-windows-gnullvm
+    cargo %* %LOCALCFG% --target x86_64-pc-windows-gnullvm
 )
 set RC=%ERRORLEVEL%
 if %RC%==0 (

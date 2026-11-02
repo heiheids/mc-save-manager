@@ -32,6 +32,9 @@ level.dat*
 session.lock
 saves/
 
+# ---- 与本项目无关的本地目录 ----
+我的世界skill*/
+
 # ---- 编辑器 / 系统 ----
 .vscode/
 .idea/

@@ -660,27 +660,103 @@ pub fn uses_split_layout(save: &Path) -> bool {
 ///
 /// **不能**用「读写打开失败」来判定占用：
 /// `session.lock` 常常是隐藏 / 只读属性的文件，以写方式打开会返回
-/// "拒绝访问 (os error 5)"，但这与游戏是否运行无关（实测游戏没开也会失败）。
+/// "拒绝访问"，但这与游戏是否运行无关（实测游戏没开也会失败）。
 /// 这会导致所有存档都被误判为「被占用」，写入全部被拒绝。
 ///
-/// 可靠判据分两级：
-/// 1. **只读打开失败**且错误码是共享冲突（32/33）→ 确实被独占
-/// 2. 能打开 → **读一个字节**，读成功说明没被锁（权限不足也能读）
+/// 判定策略按平台分开：
+///
+/// - **Windows**：文件锁表现为共享冲突，只读打开会失败，错误码
+///   ERROR_SHARING_VIOLATION(32) / ERROR_LOCK_VIOLATION(33)。
+///   能打开就说明没被锁。
+///
+/// - **Unix（Linux / macOS）**：文件锁是顾问锁（advisory lock），
+///   **不会阻止 open()**，所以「能否打开」完全说明不了问题。
+///   必须真的对文件尝试加一次 `flock`：
+///   失败（EWOULDBLOCK）说明被别的进程独占，成功则说明没被锁，
+///   加完立刻释放。
+///
+/// 注意错误码 32/33 在 Unix 上有完全不同的含义（EPIPE / EDOM），
+/// 不能跨平台直接比较数字。
 pub fn is_locked(save: &Path) -> bool {
     let path = save.join("session.lock");
     if !path.exists() {
         return false;
     }
 
-    match fs::File::open(&path) {
-        // 打不开：只有共享冲突才算被占用，权限类错误一律不算
-        Err(e) => matches!(e.raw_os_error(), Some(32) | Some(33)),
-        // 能打开：读一个字节，真被锁时读不到内容
-        Ok(mut f) => {
-            use std::io::Read;
-            let mut buf = [0u8; 1];
-            f.read(&mut buf).is_err()
+    #[cfg(windows)]
+    {
+        match fs::File::open(&path) {
+            // 打不开：只有共享冲突才算被占用，权限类错误一律不算
+            Err(e) => matches!(e.raw_os_error(), Some(32) | Some(33)),
+            // 能打开：读一个字节，真被锁时读不到内容
+            Ok(mut f) => {
+                use std::io::Read;
+                let mut buf = [0u8; 1];
+                f.read(&mut buf).is_err()
+            }
         }
+    }
+
+    #[cfg(unix)]
+    {
+        unix_is_locked(&path)
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    {
+        // 其它平台保守处理：能打开就当没锁
+        fs::File::open(&path).is_err()
+    }
+}
+
+/// Unix 下的锁检测：用 fcntl 试探锁。
+///
+/// <p><b>为什么必须是 fcntl 而不是 flock</b>：
+/// Java 的 `FileChannel.tryLock()` 在 Linux / macOS 上用的是 POSIX 记录锁
+/// （`fcntl(F_SETLK)`），而 `flock(2)` 是**另一套完全独立的锁**，
+/// 两者在 Linux 上互不干扰。用 flock 去探测 Java 持有的锁，结果永远是
+/// "能拿到锁"，于是把正在运行的游戏误判为"没锁定" —— 这会直接导致
+/// 写到一半的存档损坏。
+///
+/// <p><b>为什么申请读锁（F_RDLCK）而不是写锁</b>：
+/// POSIX 规定申请 F_WRLCK 要求文件描述符以写方式打开，但
+/// `session.lock` 常常是只读属性的，根本打不开写模式。
+/// 而 F_RDLCK 只需要读权限，且**会与游戏持有的写锁冲突**，
+/// 正好用来探测。
+///
+/// <p>结构体 `struct flock` 在不同平台字段顺序不同
+/// （Linux 与 macOS 就不一样），所以这里用 `libc` 而不是手写布局。
+#[cfg(unix)]
+fn unix_is_locked(path: &Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+
+    let Ok(f) = fs::File::open(path) else {
+        // 连读都读不了：可能是权限问题。按"没被游戏锁"处理，
+        // 真正的写入还会再失败一次并给出明确提示。
+        return false;
+    };
+
+    unsafe {
+        let mut fl: libc::flock = std::mem::zeroed();
+        fl.l_type = libc::F_RDLCK as _;
+        fl.l_whence = libc::SEEK_SET as _;
+        fl.l_start = 0;
+        fl.l_len = 0;
+
+        let rc = libc::fcntl(f.as_raw_fd(), libc::F_SETLK, &mut fl);
+        if rc == 0 {
+            // 拿到了读锁 → 没有别人持有写锁 → 没被游戏占用。
+            // 立刻释放，避免影响游戏下次启动。
+            fl.l_type = libc::F_UNLCK as _;
+            libc::fcntl(f.as_raw_fd(), libc::F_SETLK, &mut fl);
+            return false;
+        }
+
+        let code = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(0);
+        // EACCES / EAGAIN 都表示"锁被别的进程占着"
+        code == libc::EACCES || code == libc::EAGAIN
     }
 }
 

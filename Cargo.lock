@@ -1358,6 +1358,7 @@ version = "1.0.1"
 dependencies = [
  "flate2",
  "indexmap",
+ "libc",
  "lz4_flex",
  "thiserror 1.0.69",
 ]
