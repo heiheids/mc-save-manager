@@ -934,6 +934,13 @@ impl App {
                 }
                 JobResult::Failed(e) => {
                     self.set_status(format!("操作失败: {e}"), StatusKind::Error);
+                    // 任务失败时 pending 里的区块不会有任何回包，
+                    // 必须主动清掉，否则"加载中"会永久挂在屏幕上。
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        let v = tab.view_mut();
+                        v.pending.clear();
+                        v.loading = false;
+                    }
                 }
                 JobResult::Info(m) => self.set_status(m, StatusKind::Info),
             }
@@ -1040,11 +1047,31 @@ impl eframe::App for App {
                 .map(|t| t.view().loading || !t.view().pending.is_empty())
                 .unwrap_or(false);
             if stage == 1 && !busy {
-                // 首屏已完成且当前没有在跑的任务 → 补半径 20 那一圈
+                // 首屏已完成且当前没有在跑的任务 → 补半径 20 那一圈。
+                //
+                // ★ 必须先置 stage = 2 再请求：
+                //   如果半径 20 内已经没有没采样的区块（例如小存档全部装得下），
+                //   request_viewport_sample_r 会直接返回，不会产生任何"完成"回调。
+                //   要是这时还停在 stage 1，下一帧会再进来一次 ——
+                //   既白白遍历一遍索引，又把 loading 置成 true 却没人清，
+                //   结果"加载中"永远挂在屏幕上。
                 if let Some(tab) = self.tabs.get_mut(self.active) {
-                    tab.view_mut().loading = true;
+                    let v = tab.view_mut();
+                    v.expand_stage = 2;
+                    v.loading = true;
                 }
                 self.request_viewport_sample_r(None, Self::INITIAL_RADIUS);
+                // 没排出任何任务（need 为空）时 loading 会留在 true，
+                // 这里立刻纠正。
+                let idle = self
+                    .tab()
+                    .map(|t| t.view().pending.is_empty())
+                    .unwrap_or(true);
+                if idle {
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        tab.view_mut().loading = false;
+                    }
+                }
             }
         }
 
