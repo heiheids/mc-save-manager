@@ -18,7 +18,9 @@
 // debug 构建保留控制台，方便看日志/panic。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod cache;
 mod export;
+mod html_export;
 mod jobs;
 mod lang;
 mod map_view;
@@ -74,6 +76,11 @@ pub struct DimView {
     ///   1 = 首屏（FIRST_SCREEN_RADIUS）已完成，等待补齐到 INITIAL_RADIUS
     ///   2 = 已补齐，之后完全交给视口加载
     pub expand_stage: u8,
+    /// 地图画布最近的像素尺寸（宽, 高）。
+    ///
+    /// 「全图」要按真实画布比例算缩放，否则横竖会有一边溢出。
+    /// 这个值在每次 `map_view::draw` 时更新。
+    pub canvas_size: Option<(f32, f32)>,
 }
 
 impl Default for DimView {
@@ -92,6 +99,7 @@ impl Default for DimView {
             loading: false,
             full_loaded: false,
             expand_stage: 0,
+            canvas_size: None,
         }
     }
 }
@@ -347,8 +355,18 @@ pub struct App {
     pub pending_confirm: Option<ConfirmAction>,
     /// 是否显示「关于」窗口。
     pub show_about: bool,
-    /// 「全图」确认后置位：下一帧强制按当前视口重新排队。
-    pub load_all_pending: bool,
+    /// 「导出全图」对话框是否打开。
+    pub show_export_html: bool,
+    /// 导出 HTML 时勾选的维度 id。
+    pub export_dims: Vec<String>,
+    /// 「保存缓存」确认提示是否显示（区块数 > 阈值时弹出）。
+    pub show_cache_prompt: bool,
+    /// 提示里显示的区块数。
+    pub cache_prompt_chunks: usize,
+    /// 本次会话是否已经就"是否保存缓存"问过用户。
+    pub cache_prompt_done: bool,
+    /// 本次会话是否已经尝试读过缓存。
+    pub cache_load_tried: bool,
     /// 上一帧的窗口尺寸；变化时强制重绘几帧，规避 glow 后端偶发白屏。
     pub last_size: egui::Vec2,
     /// 还需要强制重绘的帧数。
@@ -447,8 +465,6 @@ pub enum ConfirmAction {
         target: (i32, i32),
     },
     SaveLevel,
-    /// 全图加载：区块很多时会读取很久，先让用户确认。
-    LoadAll { chunks: usize },
 }
 
 impl Default for App {
@@ -479,7 +495,12 @@ impl Default for App {
             autosave_delay: 0.0,
             pending_confirm: None,
             show_about: false,
-            load_all_pending: false,
+            show_export_html: false,
+            export_dims: Vec::new(),
+            show_cache_prompt: false,
+            cache_prompt_chunks: 0,
+            cache_prompt_done: false,
+            cache_load_tried: false,
             last_size: egui::Vec2::ZERO,
             repaint_frames: 3,
         }
@@ -508,8 +529,28 @@ impl App {
             Ok(world) => {
                 let name = world.level.level_name();
                 let dim_count = world.dimensions.len();
+                // 出生点要在打开时就被记录：相机默认停在 (0,0)，
+                // 而出生点往往离原点很远（实测有 (-303, 127) 的存档），
+                // 不居中就会看到一片空白，以为地图没加载。
+                let spawn = world.level.spawn();
+
                 self.tabs.push(WorldTab::new(world, path.clone()));
                 self.active = self.tabs.len() - 1;
+
+                // 把相机对准出生点（方块坐标）。
+                // 缩放保持默认 1.0×，用户滚轮即可调整。
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    let v = tab.view_mut();
+                    v.camera.center =
+                        egui::Vec2::new(spawn.0 as f32, spawn.2 as f32);
+                    v.last_view_center = None;
+                }
+
+                // 换了存档：缓存相关的会话状态要重置
+                self.cache_prompt_done = false;
+                self.cache_load_tried = false;
+                self.show_cache_prompt = false;
+
                 // 存档刚加载：显示 5 秒的一次性提示
                 self.hint_remaining = 5.0;
                 self.set_status(
@@ -707,59 +748,6 @@ impl App {
         self.jobs.spawn_sample(root, dim, need, mode);
     }
 
-    /// 把当前维度**所有**还没采样的区块排进队列（「全图」确认后调用）。
-    ///
-    /// 不能复用 `request_viewport_sample(None)` —— 那条路径会退回到
-    /// "出生点半径 20"，全图缩放下根本排不到远处的区块，
-    /// 表现出来就是地图一直空白。
-    ///
-    /// 分批提交：每批 1024 个，剩下的靠后续帧继续排，
-    /// 避免一帧塞进八万个区块把 UI 卡死。
-    pub fn request_sample_all(&mut self) {
-        const MAX_PER_BATCH: usize = 1024;
-
-        let mode = self.slice_mode();
-        let Some(tab) = self.tabs.get_mut(self.active) else {
-            return;
-        };
-
-        let mut need: Vec<(i32, i32)> = Vec::new();
-        {
-            let v = tab.view();
-            for c in tab.chunks_of_current() {
-                let key = (c.x, c.z);
-                if v.map.contains(key) || v.pending.contains(&key) {
-                    continue;
-                }
-                need.push(key);
-                if need.len() >= MAX_PER_BATCH {
-                    break;
-                }
-            }
-        }
-
-        if need.is_empty() {
-            // 全都加载完了
-            tab.view_mut().loading = false;
-            self.set_status("全图区块已全部加载", StatusKind::Success);
-            return;
-        }
-
-        {
-            let v = tab.view_mut();
-            for k in &need {
-                v.pending.insert(*k);
-            }
-            v.loading = true;
-        }
-
-        let dim = match tab.dim().cloned() {
-            Some(d) => d,
-            None => return,
-        };
-        let root = tab.path.clone();
-        self.jobs.spawn_sample(root, dim, need, mode);
-    }
 
     /// 为当前维度启动地图采样。
     ///
@@ -776,10 +764,9 @@ impl App {
         }
         // 打开存档时只加载出生点周围一圈，不再全量采样。
         //
-        // 这里刻意用**更小的** FIRST_SCREEN_RADIUS 先出图：
-        // 实测 1.21.1 存档单区块采样 5.7 ms，半径 20 要 9.6 秒才出第一张图，
-        // 用户会以为程序卡死。半径 5 只要约 0.7 秒。
-        // 补齐到 INITIAL_RADIUS（以及更远）由视口加载在后续帧自动完成。
+        // 半径 5 先出图（约 0.7 秒），补齐到半径 20 由后续帧的
+        // 展开阶段完成。出生点已经在 open_world 里置为相机中心，
+        // 所以这一圈正好铺满首屏。
         self.request_viewport_sample_r(None, Self::FIRST_SCREEN_RADIUS);
     }
 
@@ -815,8 +802,6 @@ impl App {
 
     /// 处理后台任务返回。
     fn handle_results(&mut self, ctx: &egui::Context, results: Vec<JobResult>) {
-        // 全图加载：某批完成后需要继续排下一批
-        let mut more_after_full = false;
         for r in results {
             match r {
                 JobResult::Scanned {
@@ -922,12 +907,6 @@ impl App {
                             } else {
                                 v.expand_stage = 2;
                             }
-                            // 全图加载中：这一批做完就接着排下一批。
-                            // 不这样做的话，request_sample_all 只排了 1024 个，
-                            // 剩下的永远不会被处理，地图停在半空状态。
-                            if v.full_loaded {
-                                more_after_full = true;
-                            }
                         }
                         // 只要队列空了就撤掉"加载中"，不必等 complete：
                         // 中途可能有新批次插进来，死等 complete 会让提示卡住。
@@ -994,6 +973,50 @@ impl App {
                         StatusKind::Success,
                     );
                 }
+                JobResult::CacheSaved { message } => {
+                    self.set_status(message, StatusKind::Success);
+                }
+                JobResult::CacheSaveFailed { error } => {
+                    self.set_status(format!("保存缓存失败: {error}"), StatusKind::Error);
+                }
+                JobResult::CacheLoaded {
+                    dimension,
+                    tiles,
+                    stale,
+                } => {
+                    let reused = tiles.len();
+                    let stale_n = stale.len();
+                    if let Some(tab) = self.tab_mut() {
+                        let v = tab.ensure_view(&dimension);
+                        for (key, px) in &tiles {
+                            v.map.insert_from_pixels(ctx, *key, px.clone());
+                        }
+                        v.sampled = true;
+                        v.expand_stage = 2;
+                        // 变化的区块排进重采样队列
+                        for key in &stale {
+                            v.pending.insert(*key);
+                        }
+                    }
+                    if reused > 0 {
+                        self.set_status(
+                            format!(
+                                "已从缓存载入 {reused} 个区块的缩略图（{stale_n} 个有变动，正在更新）"
+                            ),
+                            StatusKind::Info,
+                        );
+                    }
+                    // 有变动的区块立刻重新采样
+                    if stale_n > 0 {
+                        self.request_stale_resample();
+                    }
+                }
+                JobResult::HtmlExported { message } => {
+                    self.set_status(message, StatusKind::Success);
+                }
+                JobResult::HtmlExportFailed { error } => {
+                    self.set_status(format!("导出失败: {error}"), StatusKind::Error);
+                }
                 JobResult::Failed(e) => {
                     self.set_status(format!("操作失败: {e}"), StatusKind::Error);
                     // 任务失败时 pending 里的区块不会有任何回包，
@@ -1008,13 +1031,85 @@ impl App {
             }
         }
 
-        // 全图加载：接着排下一批（每批 1024）
-        if more_after_full {
-            self.request_sample_all();
-        }
     }
 
     /// 重新扫描当前维度（写操作后）。
+    pub fn request_stale_resample(&mut self) {
+        let mode = self.slice_mode();
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let need: Vec<(i32, i32)> = tab.view().pending.iter().copied().collect();
+        if need.is_empty() {
+            return;
+        }
+        let dim = match tab.dim().cloned() {
+            Some(d) => d,
+            None => return,
+        };
+        let root = tab.path.clone();
+        tab.view_mut().loading = true;
+        self.jobs.spawn_sample(root, dim, need, mode);
+    }
+
+    /// 触发一次"保存缓存"。
+    ///
+    /// 把当前维度已渲染的缩略图连同 region 指纹存到磁盘。
+    /// 下次打开同一存档时可以直接复用，省掉重新采样的时间。
+    pub fn request_save_cache(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let dim = match tab.dim().cloned() {
+            Some(d) => d,
+            None => return,
+        };
+
+        // 从纹理缓存里取出每区块的像素
+        let tiles = tab.view().map.snapshot_for_cache();
+        if tiles.is_empty() {
+            self.set_status("当前维度还没有已渲染的区块，无法保存缓存", StatusKind::Info);
+            return;
+        }
+
+        let save_root = tab.path.clone();
+        let slice = slice_key(&self.slice_mode());
+        let dv = tab.world.level.data_version();
+        let region_dir = dim.dir(mcworld_core::world::RegionKind::Terrain);
+        let n = tiles.len();
+
+        self.jobs.spawn_save_cache(
+            save_root,
+            dim.id.clone(),
+            dim.display.clone(),
+            region_dir,
+            slice,
+            dv,
+            tiles,
+        );
+        self.set_status(format!("正在保存 {n} 个区块的缩略图缓存…"), StatusKind::Info);
+    }
+
+    /// 打开存档后尝试读缓存。
+    ///
+    /// 读到就直接把缩略图塞进纹理缓存，只对"变了"的区块重新采样。
+    pub fn try_load_cache(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let dim = match tab.dim().cloned() {
+            Some(d) => d,
+            None => return,
+        };
+        let save_root = tab.path.clone();
+        let slice = slice_key(&self.slice_mode());
+        let dv = tab.world.level.data_version();
+        let region_dir = dim.dir(mcworld_core::world::RegionKind::Terrain);
+
+        self.jobs
+            .spawn_load_cache(save_root, dim.id, region_dir, slice, dv);
+    }
+
     /// 局部刷新：只重扫指定区块范围（外扩 `REFRESH_MARGIN` 圈）。
     ///
     /// 删除区块后调用。相比 `refresh_current`（整体作废 + 全量重扫），
@@ -1101,6 +1196,28 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
+        // ---- 大存档：提示可以保存缩略图缓存 ----
+        //
+        // 区块数超过阈值时弹一次提示。只弹一次（cache_prompt_done），
+        // 否则每次扫描完成都弹会很烦。
+        if !self.cache_prompt_done {
+            let n = self.tab().map(|t| t.chunk_count()).unwrap_or(0);
+            if n > 2000 {
+                self.cache_prompt_done = true;
+                self.cache_prompt_chunks = n;
+                self.show_cache_prompt = true;
+            }
+        }
+
+        // ---- 初次扫描完成后尝试读缓存 ----
+        if !self.cache_load_tried {
+            let ready = self.tab().map(|t| t.is_scanned()).unwrap_or(false);
+            if ready {
+                self.cache_load_tried = true;
+                self.try_load_cache();
+            }
+        }
+
         // 初始加载的展开阶段：
         //   阶段 1 → 把半径补齐到 INITIAL_RADIUS（首屏只做过半径 5）
         //   阶段 2 → 之后完全交给视口加载，不再主动补
@@ -1140,12 +1257,6 @@ impl eframe::App for App {
                     }
                 }
             }
-        }
-
-        // 「全图」确认后：把**整个维度**的区块排进队列
-        if self.load_all_pending {
-            self.load_all_pending = false;
-            self.request_sample_all();
         }
 
         // 重载存档请求
@@ -1222,6 +1333,136 @@ fn window_icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result<()> {
+    // 无界面导出模式：
+    //   mcworld-app <存档路径> --export-html <输出.html> [维度id ...]
+    //
+    // 便于批处理，也方便在没有图形环境时导出。
+    // 不指定维度就是全部维度。
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        // 无界面缓存自检：
+        //   mcworld-app <存档> --cache-test
+        // 保存一份缓存 → 立刻读回 → 对比指纹，验证整条链路。
+        if args.iter().any(|a| a == "--cache-test") {
+            let no_save = args.iter().any(|a| a == "--no-save");
+            let save = args.first().cloned().unwrap_or_default();
+            if save.is_empty() {
+                eprintln!("用法: mcworld-app <存档> --cache-test");
+                std::process::exit(2);
+            }
+            let root = std::path::Path::new(&save);
+            let world = match World::open(root) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("打开失败: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let dv = world.level.data_version();
+            let mut any = false;
+            for dim in &world.dimensions {
+                if !dim.exists(mcworld_core::world::RegionKind::Terrain) {
+                    continue;
+                }
+                let metas = world.scan_chunks(dim, &mut |_, _| {}).unwrap_or_default();
+                if metas.is_empty() {
+                    continue;
+                }
+                any = true;
+
+                // 造几块假缩略图（16x16 RGBA），模拟已渲染的区块
+                let mut tiles: Vec<((i32, i32), Vec<u8>)> = Vec::new();
+                for (i, m) in metas.iter().take(50).enumerate() {
+                    let mut px = vec![0u8; 16 * 16 * 4];
+                    for q in px.chunks_exact_mut(4) {
+                        q[0] = (i * 5) as u8;
+                        q[1] = 100;
+                        q[2] = 50;
+                        q[3] = 255;
+                    }
+                    tiles.push(((m.x, m.z), px));
+                }
+
+                let safe: String = dim
+                    .id
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .collect();
+                let dir = crate::cache::save_cache_dir(root).join(safe);
+                let region_dir = dim.dir(mcworld_core::world::RegionKind::Terrain);
+                let stamps = crate::cache::collect_stamps(&region_dir);
+                let meta = crate::cache::CacheMeta {
+                    dim_id: dim.id.clone(),
+                    slice: "surface".into(),
+                    data_version: dv,
+                    regions: stamps,
+                    chunks: tiles.iter().map(|(k, _)| *k).collect(),
+                };
+                let data: Vec<Vec<u8>> = tiles.iter().map(|(_, px)| px.clone()).collect();
+
+                if !no_save {
+                if let Err(e) = crate::cache::save(&dir, &meta, &data) {
+                    eprintln!("[{}] 保存失败: {e}", dim.display);
+                    continue;
+                }
+                println!("[{}] 保存 {} 个区块缩略图 -> {}", dim.display, data.len(), dir.display());
+                }
+
+                match crate::cache::load(&dir) {
+                    Some((m2, t2)) => {
+                        println!("[{}] 读回 {} 区块, dim={}, dv={}", dim.display, t2.len(), m2.dim_id, m2.data_version);
+                        let now = crate::cache::collect_stamps(&region_dir);
+                        let changed = m2.changed_regions(&now);
+                        if changed.is_empty() {
+                            println!("[{}] OK 指纹一致，可直接复用", dim.display);
+                        } else {
+                            println!("[{}] WARN 检测到 {} 个 region 变化", dim.display, changed.len());
+                        }
+                        println!("[{}] OK 首块像素 {} {} {} {}", dim.display,
+                            t2[0][0], t2[0][1], t2[0][2], t2[0][3]);
+                    }
+                    None => println!("[{}] FAIL 读回失败", dim.display),
+                }
+                println!();
+            }
+            if !any {
+                eprintln!("没有可测试的维度");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
+
+        if let Some(pos) = args.iter().position(|a| a == "--export-html") {
+            let save = args.first().cloned().unwrap_or_default();
+            let out = args.get(pos + 1).cloned().unwrap_or_default();
+            let dims: Vec<String> = args.iter().skip(pos + 2).cloned().collect();
+            if save.is_empty() || out.is_empty() {
+                eprintln!("用法: mcworld-app <存档> --export-html <输出.html> [维度...]");
+                std::process::exit(2);
+            }
+            match crate::html_export::export_html(
+                std::path::Path::new(&save),
+                &dims,
+                std::path::Path::new(&out),
+                mcworld_core::chunk::SliceMode::Surface,
+                &mut |dim, done, total| {
+                    if done % 200 == 0 || done == total {
+                        eprintln!("{dim} {done}/{total}");
+                    }
+                },
+            ) {
+                Ok(msg) => {
+                    println!("{msg}");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("导出失败: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
     let title = concat!("Minecraft 存档管理器 v", env!("CARGO_PKG_VERSION"));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1237,4 +1478,13 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
+}
+
+
+/// 切片方式的稳定字符串表示（缓存指纹用）。
+fn slice_key(mode: &mcworld_core::chunk::SliceMode) -> String {
+    match mode {
+        mcworld_core::chunk::SliceMode::Surface => "surface".to_string(),
+        mcworld_core::chunk::SliceMode::Fixed(y) => format!("fixed:{y}"),
+    }
 }

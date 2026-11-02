@@ -86,6 +86,8 @@ pub fn toolbar(app: &mut App, ctx: &egui::Context) {
     let mut pending_undo = false;
     let mut pending_reload = false;
     let mut pending_about = false;
+    let mut pending_export_html = false;
+    let mut pending_save_cache = false;
 
     egui::TopBottomPanel::top("toolbar")
         .frame(
@@ -176,6 +178,26 @@ pub fn toolbar(app: &mut App, ctx: &egui::Context) {
                         .clicked()
                     {
                         import_any(app);
+                    }
+
+                    if ui
+                        .add(theme::tool_button("导出全图"))
+                        .on_hover_text(
+                            "把整个世界渲染成 HTML 网页（可离线打开，鼠标查看坐标与群系）",
+                        )
+                        .clicked()
+                    {
+                        pending_export_html = true;
+                    }
+
+                    if ui
+                        .add(theme::tool_button("保存缓存"))
+                        .on_hover_text(
+                            "把已渲染的缩略图存到磁盘，下次打开同一存档可秒开（大存档推荐）",
+                        )
+                        .clicked()
+                    {
+                        pending_save_cache = true;
                     }
 
                     ui.separator();
@@ -354,6 +376,12 @@ pub fn toolbar(app: &mut App, ctx: &egui::Context) {
     }
     if pending_about {
         app.show_about = true;
+    }
+    if pending_export_html {
+        app.show_export_html = true;
+    }
+    if pending_save_cache {
+        app.request_save_cache();
     }
 }
 
@@ -1043,8 +1071,6 @@ pub fn map_area(app: &mut App, ctx: &egui::Context) {
     let mut show_about = false;
     // 本帧是否需要为视口补加载区块
     let mut viewport_needs_load = false;
-    // 本帧点了「全图」，需要弹确认框（区块数）
-    let mut pending_load_all: Option<usize> = None;
     // 本帧的地图画布矩形（用于视口计算）
     let mut map_viewport: Option<egui::Rect> = None;
     let mut paste_done = false;
@@ -1181,18 +1207,6 @@ pub fn map_area(app: &mut App, ctx: &egui::Context) {
                             v.camera.scale = 1.5;
                         }
                     }
-                    if ui
-                        .small_button("全图")
-                        .on_hover_text("缩放到能看见全部区块（会按需加载，可能较慢）")
-                        .clicked()
-                    {
-                        // 先弹确认框，**不要**立刻 fit_all：
-                        // 早期写法是先缩放再弹框，但缩放会让视口立刻变大，
-                        // 视口加载在下一帧就会把成千上万个区块排进队列，
-                        // 用户还没点"确认"就已经开始读盘了 —— 确认框形同虚设。
-                        let n = tab.chunk_count();
-                        pending_load_all = Some(n);
-                    }
                     ui.label(
                         RichText::new(format!("{:.2}×", tab.view().camera.scale))
                             .size(12.0)
@@ -1280,6 +1294,9 @@ pub fn map_area(app: &mut App, ctx: &egui::Context) {
                 spawn,
                 opts,
             );
+
+            // 记录画布尺寸：fit_all 要按真实宽高比例算缩放
+            v.canvas_size = Some((resp.canvas_w, resp.canvas_h));
 
             // ---- "加载中"提示（画在画布右上角）----
             {
@@ -1442,9 +1459,6 @@ pub fn map_area(app: &mut App, ctx: &egui::Context) {
         if show_about {
             app.show_about = true;
         }
-        if let Some(n) = pending_load_all {
-            app.pending_confirm = Some(ConfirmAction::LoadAll { chunks: n });
-        }
 
         // 视口内还有没采样的区块 → 排进后台队列。
         // 这里放在绘制之后，拿到的 viewport 才是本帧真实尺寸。
@@ -1456,38 +1470,70 @@ pub fn map_area(app: &mut App, ctx: &egui::Context) {
 fn fit_all(tab: &mut WorldTab) {
     // 先算范围（借用不可变），再改相机（借用可变）——
     // 不能边持有 chunks 切片边 view_mut()。
+    // ★ 视野取**最大的那片连通区域**，而不是全部区块的外接矩形。
+    //
+    //   实测主世界的分布是这样的：
+    //     94% 的区块在 X -192..191（主要活动区）
+    //      6% 在 X 1728..1919（远处零散探索点），两者相距约 1800 区块。
+    //
+    //   按全部区块的外接矩形算，视野会被那 6% 撑大十倍，
+    //   主体只能占画布左边一小块 —— 用户点「全图」想看的是主体。
+    //
+    //   改用"最大连通片区"的包围盒：主体铺满画布，远处的零散点
+    //   落在视野外（想看的话拖过去，视口加载会补上）。
+    //   没有片区信息时退回全部区块的外接矩形。
     let (min_x, max_x, min_z, max_z) = {
         let chunks = tab.chunks_of_current();
         if chunks.is_empty() {
             return;
         }
-        let mut min_x = i32::MAX;
-        let mut max_x = i32::MIN;
-        let mut min_z = i32::MAX;
-        let mut max_z = i32::MIN;
-        for c in chunks {
-            min_x = min_x.min(c.x);
-            max_x = max_x.max(c.x);
-            min_z = min_z.min(c.z);
-            max_z = max_z.max(c.z);
+
+        // 优先用最大片区
+        if let Some(best) = tab
+            .view()
+            .regions
+            .iter()
+            .max_by_key(|r| r.chunk_count)
+        {
+            let (bx0, bz0, bx1, bz1) = best.bounds;
+            // 片区可能只覆盖主体的一部分，稍微外扩一点更自然
+            (bx0, bx1, bz0, bz1)
+        } else {
+            let mut xs: Vec<i32> = chunks.iter().map(|c| c.x).collect();
+            let mut zs: Vec<i32> = chunks.iter().map(|c| c.z).collect();
+            xs.sort_unstable();
+            zs.sort_unstable();
+            (xs[0], xs[xs.len() - 1], zs[0], zs[zs.len() - 1])
         }
-        (min_x, max_x, min_z, max_z)
     };
     let cx = (min_x + max_x) as f32 * 8.0 + 8.0;
     let cz = (min_z + max_z) as f32 * 8.0 + 8.0;
-    let span = ((max_x - min_x).max(max_z - min_z) as f32 * 16.0).max(32.0);
 
-    // ★ 缩放下限必须允许"很小"：
-    //   大存档跨度可达 47000 方块（82419 个区块），要塞进 ~1400 像素的画布，
-    //   需要 0.03 甚至更小。原来 clamp 到 0.05，全图就只能看到一片边角，
-    //   看起来像"全图没生效"。
+    // ★ 宽高分别算，取更小的缩放，才能保证两个方向都装得下。
     //
-    //   这里按 1500 像素估算画布宽度（实际窗口宽度会略有出入，
-    //   但低到 0.005 已经足够，差几十像素看不出来）。
-    let canvas_w = 1500.0_f32;
+    //   早期只用一个 `span = max(横向, 纵向)` 配一个硬编码的画布宽度，
+    //   问题有两个：
+    //     1. 画布不是正方形，横向 1200、纵向 800，用同一个边长必然有
+    //        一边溢出（实测全图后左侧内容被切掉）；
+    //     2. 硬编码 1500 与真实宽度差 300，缩放偏小约 25%，
+    //        叠加起来就会"以为缩到全图了，其实只看得到一角"。
+    //
+    //   这里按实际地图区尺寸算。取不到真实尺寸时退回 1200×800（窗口
+    //   默认大小下的地图区），误差可接受。
+    let (canvas_w, canvas_h) = tab
+        .view()
+        .canvas_size
+        .unwrap_or((1200.0, 800.0));
+
+    let span_x = ((max_x - min_x + 1) as f32 * 16.0).max(32.0);
+    let span_z = ((max_z - min_z + 1) as f32 * 16.0).max(32.0);
+    let scale_x = canvas_w / span_x;
+    let scale_z = canvas_h / span_z;
+    let scale = scale_x.min(scale_z).clamp(0.002, 4.0);
+
     let v = tab.view_mut();
     v.camera.center = Vec2::new(cx, cz);
-    v.camera.scale = (canvas_w / span).clamp(0.002, 4.0);
+    v.camera.scale = scale;
 }
 
 /// 底部状态栏。
@@ -1727,6 +1773,13 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
         about_window(app, ctx);
     }
 
+    if app.show_export_html {
+        export_html_window(app, ctx);
+    }
+    if app.show_cache_prompt {
+        cache_prompt_window(app, ctx);
+    }
+
     // 危险操作确认
     if let Some(action) = app.pending_confirm.take() {
         let mut confirmed = false;
@@ -1775,16 +1828,6 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
                 "确认粘贴".to_string(),
                 format!("将把剪贴板中的 {count} 个区块粘贴到 {dim}，覆盖原有区块。\n\n操作前会自动备份。"),
             ),
-            ConfirmAction::LoadAll { chunks } => (
-                "确认加载全图".to_string(),
-                format!(
-                    "如果世界已加载区块较多，会用很多时间读取，请等待。\n\n\
-                     当前维度共 {chunks} 个区块。\n\n\
-                     缩放比例会先跳到全图视野，区块将在后台逐个采样，\n\
-                     地图上会逐步出现内容。\n\n\
-                     已加载过的区块会保留缩略图，不会重复读盘。"
-                ),
-            ),
             ConfirmAction::SaveLevel => (
                 "确认保存 level.dat".to_string(),
                 "将把左侧表单的修改写入 level.dat。\n原文件会先备份为 level.dat_old。".to_string(),
@@ -1832,23 +1875,6 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
 
 fn execute_confirmed(app: &mut App, action: ConfirmAction) {
     match action {
-        ConfirmAction::LoadAll { .. } => {
-            // 用户已确认：把所有视口都会覆盖到的区块排进队列。
-            // 具体做法是把相机缩到全图后，由常规的视口加载逻辑接管 ——
-            // 它会按视野逐个补，而不是一次性提交上万个区块。
-            app.set_status(
-                "正在加载全图区块，请稍候…（已加载过的会跳过）",
-                StatusKind::Info,
-            );
-            // 先缩放，再清视口缓存让下一帧重新排队 —— 顺序不能反。
-            if let Some(tab) = app.tabs.get_mut(app.active) {
-                fit_all(tab);
-                let v = tab.view_mut();
-                v.last_view_center = None;
-                v.full_loaded = true;
-            }
-            app.load_all_pending = true;
-        }
         ConfirmAction::SaveLevel => {
             let Some(tab) = app.tabs.get_mut(app.active) else { return };
             let label = format!("修改 level.dat（{}）", tab.edit_name);
@@ -2538,4 +2564,189 @@ fn save_level(tab: &mut WorldTab) -> Result<(String, std::path::PathBuf), String
         "level.dat 已保存（可用「撤销」还原）".to_string(),
         backup_dir,
     ))
+}
+
+
+/// 「导出全图 HTML」对话框。
+///
+/// 程序内不再提供全图视图（8 万区块缩到 0.04× 每区块不到 1 像素，
+/// 又拖又卡），改成导出成网页：浏览器缩放流畅，还能标坐标与群系。
+fn export_html_window(app: &mut App, ctx: &egui::Context) {
+    // 维度列表：从当前存档取
+    let dims: Vec<(String, String)> = app
+        .tab()
+        .map(|t| {
+            t.world
+                .dimensions
+                .iter()
+                .map(|d| (d.id.clone(), d.display.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 首次打开：默认全选
+    if app.export_dims.is_empty() && !dims.is_empty() {
+        app.export_dims = dims.iter().map(|(id, _)| id.clone()).collect();
+    }
+
+    let mut open = app.show_export_html;
+    let mut start = false;
+
+    egui::Window::new("导出全图 HTML")
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.set_min_width(420.0);
+
+            ui.label("把世界渲染成一个可离线打开的网页：");
+            ui.label(
+                RichText::new("网页里滚轮缩放、拖动画布，鼠标移上去显示方块坐标与群系。")
+                    .size(12.0)
+                    .color(theme::TEXT_DIM),
+            );
+            ui.add_space(8.0);
+
+            ui.label(RichText::new("导出哪些维度").strong());
+            for (id, display) in &dims {
+                let mut checked = app.export_dims.iter().any(|d| d == id);
+                if ui.checkbox(&mut checked, display).changed() {
+                    if checked {
+                        app.export_dims.push(id.clone());
+                    } else {
+                        app.export_dims.retain(|d| d != id);
+                    }
+                }
+            }
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.small_button("全选").clicked() {
+                    app.export_dims = dims.iter().map(|(id, _)| id.clone()).collect();
+                }
+                if ui.small_button("全不选").clicked() {
+                    app.export_dims.clear();
+                }
+            });
+
+            ui.add_space(10.0);
+            let total: usize = app.tab().map(|t| t.chunk_count()).unwrap_or(0);
+            ui.label(
+                RichText::new(format!(
+                    "当前维度共 {total} 个区块。区块多时会自动降低贴图精度，\
+                     8 万区块大约需要几十秒。"
+                ))
+                .size(12.0)
+                .color(theme::TEXT_DIM),
+            );
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let can = !app.export_dims.is_empty() && app.tab().is_some();
+                if ui
+                    .add_enabled(
+                        can,
+                        egui::Button::new("选择保存位置并导出")
+                            .fill(theme::ACCENT_SOFT),
+                    )
+                    .clicked()
+                {
+                    start = true;
+                }
+                if ui.button("取消").clicked() {
+                    app.show_export_html = false;
+                }
+            });
+        });
+
+    app.show_export_html = open;
+
+    if start {
+        start_html_export(app);
+    }
+}
+
+/// 弹出保存对话框并启动后台导出。
+fn start_html_export(app: &mut App) {
+    let Some(tab) = app.tab() else {
+        app.set_status("没有打开的存档", StatusKind::Error);
+        return;
+    };
+    let name = tab.name.clone();
+    let root = tab.path.clone();
+    let dims = app.export_dims.clone();
+    let mode = app.slice_mode();
+
+    let default_name = format!("{name}_地图.html");
+    let Some(out) = rfd::FileDialog::new()
+        .set_file_name(default_name)
+        .add_filter("HTML 网页", &["html"])
+        .save_file()
+    else {
+        return;
+    };
+
+    app.jobs.spawn_export_html(root, dims, out, mode);
+    app.show_export_html = false;
+    app.set_status("正在导出全图，请稍候…", StatusKind::Info);
+}
+
+
+/// 「大存档可以保存缓存」提示。
+///
+/// 触发条件：当前维度区块数 > 2000。只在每次打开存档后问一次。
+fn cache_prompt_window(app: &mut App, ctx: &egui::Context) {
+    let n = app.cache_prompt_chunks;
+    let mut open = app.show_cache_prompt;
+    let mut do_save = false;
+
+    egui::Window::new("存档较大，建议保存缩略图缓存")
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.set_min_width(430.0);
+
+            ui.label(format!(
+                "当前维度有 {n} 个区块。每次打开都要重新读盘采样，比较慢。"
+            ));
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("保存缓存后：")
+                    .strong(),
+            );
+            ui.label("· 缩略图与每个 region 的指纹一起存到磁盘");
+            ui.label("· 下次打开先读缓存，只重算「region 文件有变化」的部分");
+            ui.label("· 缓存位置：程序所在目录下的「地图缓存」文件夹");
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("存档没改动的话，下次几乎是秒开。")
+                    .size(12.0)
+                    .color(theme::TEXT_DIM),
+            );
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new("现在保存缓存").fill(theme::ACCENT_SOFT))
+                    .clicked()
+                {
+                    do_save = true;
+                }
+                if ui.button("以后再说").clicked() {
+                    app.show_cache_prompt = false;
+                }
+            });
+        });
+
+    if !open {
+        app.show_cache_prompt = false;
+    }
+
+    if do_save {
+        app.show_cache_prompt = false;
+        app.request_save_cache();
+    }
 }

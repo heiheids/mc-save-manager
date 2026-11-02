@@ -16,6 +16,18 @@ use crate::theme;
 /// 一张区块缩略图纹理。
 pub struct ChunkTile {
     pub texture: TextureHandle,
+    /// 该区块 16×16 像素的平均颜色。
+    ///
+    /// 缩得很小（每区块不足 1.5 像素）时直接用它画矩形 ——
+    /// 这个尺寸下纹理细节本来也看不见，而 painter.image 一个亚像素
+    /// 四边形会被光栅化丢弃，导致全图看起来一片黑。
+    pub avg_color: Color32,
+    /// 16×16 RGBA 原始像素（1 KB）。
+    ///
+    /// 保留它有两个用处：
+    ///   1. 保存缩略图缓存时直接落盘，不必重新读存档
+    ///   2. 悬停查询可以省掉一次磁盘读取
+    pub pixels: Vec<u8>,
     /// 采样列数据，供鼠标悬停查询方块与高度。
     ///
     /// **默认不保留**：这是"缩略图化"的关键。
@@ -65,6 +77,38 @@ impl TileCache {
                 surface.z * 16 + z as i32,
             );
         }
+        // 原始 RGBA 像素（缓存要落盘它）
+        let mut pixels = Vec::with_capacity(16 * 16 * 4);
+        for px in &img.pixels {
+            pixels.push(px.r());
+            pixels.push(px.g());
+            pixels.push(px.b());
+            pixels.push(px.a());
+        }
+
+        // 顺便算平均色（缩到很小时用纯色代替纹理）
+        let mut ar = 0u32;
+        let mut ag = 0u32;
+        let mut ab = 0u32;
+        let mut an = 0u32;
+        for px in &img.pixels {
+            if px.a() > 0 {
+                ar += px.r() as u32;
+                ag += px.g() as u32;
+                ab += px.b() as u32;
+                an += 1;
+            }
+        }
+        let avg_color = if an > 0 {
+            Color32::from_rgb(
+                (ar / an) as u8,
+                (ag / an) as u8,
+                (ab / an) as u8,
+            )
+        } else {
+            Color32::TRANSPARENT
+        };
+
         let tex = ctx.load_texture(
             format!("chunk-{}-{}", surface.x, surface.z),
             img,
@@ -77,6 +121,8 @@ impl TileCache {
             (surface.x, surface.z),
             ChunkTile {
                 texture: tex,
+                avg_color,
+                pixels,
                 columns: Vec::new(),
             },
         );
@@ -103,10 +149,75 @@ impl TileCache {
         self.tiles.iter()
     }
 
+    /// 从缓存的原始像素重建纹理（读缓存时用）。
+    ///
+    /// 与 `insert` 的区别：这里没有 ChunkSurface，
+    /// 全部信息来自磁盘上的缩略图。
+    pub fn insert_from_pixels(
+        &mut self,
+        ctx: &egui::Context,
+        key: (i32, i32),
+        pixels: Vec<u8>,
+    ) {
+        if pixels.len() != 16 * 16 * 4 {
+            return;
+        }
+        let mut img = ColorImage::filled([16, 16], Color32::TRANSPARENT);
+        let mut ar = 0u32;
+        let mut ag = 0u32;
+        let mut ab = 0u32;
+        let mut an = 0u32;
+        for i in 0..256 {
+            let r = pixels[i * 4];
+            let g = pixels[i * 4 + 1];
+            let b = pixels[i * 4 + 2];
+            let a = pixels[i * 4 + 3];
+            img.pixels[i] = Color32::from_rgba_unmultiplied(r, g, b, a);
+            if a > 0 {
+                ar += r as u32;
+                ag += g as u32;
+                ab += b as u32;
+                an += 1;
+            }
+        }
+        let avg_color = if an > 0 {
+            Color32::from_rgb((ar / an) as u8, (ag / an) as u8, (ab / an) as u8)
+        } else {
+            Color32::TRANSPARENT
+        };
+
+        let tex = ctx.load_texture(
+            format!("chunk-{}-{}", key.0, key.1),
+            img,
+            TextureOptions::NEAREST,
+        );
+        self.tiles.insert(
+            key,
+            ChunkTile {
+                texture: tex,
+                avg_color,
+                pixels,
+                columns: Vec::new(),
+            },
+        );
+    }
+
     pub fn get(&self, key: (i32, i32)) -> Option<&ChunkTile> {
         self.tiles.get(&key)
     }
 
+
+    /// 取出所有缩略图的像素，供写入缓存。
+    ///
+    /// 早期实现里 `ChunkTile` 只保留 texture 不保留像素，
+    /// 所以这里改成把像素一起存着 —— 16×16 RGBA 只有 1 KB，
+    /// 8 万区块也就 80 MB，比重新读盘几十分钟划算得多。
+    pub fn snapshot_for_cache(&self) -> Vec<((i32, i32), Vec<u8>)> {
+        self.tiles
+            .iter()
+            .map(|(k, t)| (*k, t.pixels.clone()))
+            .collect()
+    }
 
     pub fn clear(&mut self) {
         self.tiles.clear();
@@ -193,6 +304,11 @@ impl MapCamera {
 /// 地图交互结果。
 #[derive(Clone, Debug, Default)]
 pub struct MapResponse {
+    /// 本帧实际绘制出来的区块数。
+    pub drawn: usize,
+    /// 本帧画布的像素尺寸（供「全图」按比例算缩放）。
+    pub canvas_w: f32,
+    pub canvas_h: f32,
     /// 本帧点击的世界坐标（方块）。
     pub clicked_world: Option<(f64, f64)>,
     /// 鼠标当前所在的世界坐标（方块），用于显示坐标/区块/群系。
@@ -305,6 +421,8 @@ pub fn draw(
     let visible = cam.visible_world_rect(rect);
     let chunk_px = 16.0 * cam.scale;
     let mut drawn = 0usize;
+    let (mut dbg_min_x, mut dbg_max_x) = (i32::MAX, i32::MIN);
+    let (mut dbg_min_z, mut dbg_max_z) = (i32::MAX, i32::MIN);
 
     // ★ 遍历**已有的缩略图**，而不是遍历可见矩形。
     //
@@ -326,15 +444,29 @@ pub fn draw(
             continue;
         }
         let p0 = cam.world_to_screen(world_min, rect);
-        let cell = Rect::from_min_size(p0, Vec2::splat(chunk_px));
-        painter.image(
-            tile.texture.id(),
-            cell,
-            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-            Color32::WHITE,
-        );
+        // 区块在屏幕上不足 1 像素时，用纹理采样出的平均色画一个矩形。
+        //
+        // 直接 painter.image 一个 0.75×0.75 像素的四边形，
+        // 会被光栅化丢掉（或只画出一个抖动点），全图缩小后整片是黑的。
+        // 这时它的信息量本来也只剩"平均颜色"，画矩形既快又稳。
+        let cell = Rect::from_min_size(p0, Vec2::splat(chunk_px.max(1.0)));
+        if chunk_px < 1.5 {
+            painter.rect_filled(cell, 0.0, tile.avg_color);
+        } else {
+            painter.image(
+                tile.texture.id(),
+                cell,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
         drawn += 1;
+        if cx < dbg_min_x { dbg_min_x = cx; }
+        if cx > dbg_max_x { dbg_max_x = cx; }
+        if cz < dbg_min_z { dbg_min_z = cz; }
+        if cz > dbg_max_z { dbg_max_z = cz; }
     }
+    let _ = (dbg_min_x, dbg_max_x, dbg_min_z, dbg_max_z);
 
     // 还没采样的区域：只在**放大到足够近**时才画占位格。
     // 缩得很小时画占位没有意义（一片糊），反而浪费绘制调用。
@@ -653,5 +785,8 @@ pub fn draw(
         painter.galley(pos + Vec2::new(6.0, 3.0), galley, Color32::WHITE);
     }
 
+    out.drawn = drawn;
+    out.canvas_w = rect.width();
+    out.canvas_h = rect.height();
     out
 }

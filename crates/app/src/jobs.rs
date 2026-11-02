@@ -17,6 +17,30 @@ pub struct Progress {
 
 /// 后台任务的返回值。
 pub enum JobResult {
+    /// HTML 全图导出完成
+    HtmlExported {
+        message: String,
+    },
+    /// HTML 全图导出失败
+    HtmlExportFailed {
+        error: String,
+    },
+    /// 缩略图缓存保存完成
+    CacheSaved {
+        message: String,
+    },
+    /// 缩略图缓存保存失败
+    CacheSaveFailed {
+        error: String,
+    },
+    /// 缓存已读回：可直接复用这些缩略图
+    CacheLoaded {
+        dimension: String,
+        /// 可以复用的区块 → 16×16 RGBA
+        tiles: Vec<((i32, i32), Vec<u8>)>,
+        /// 因 region 变化而需要重新采样的区块
+        stale: Vec<(i32, i32)>,
+    },
     /// 扫描完成：区块元数据 + 实体 + 方块实体
     Scanned {
         dimension: String,
@@ -366,6 +390,173 @@ impl Jobs {
             if let Err(e) = result {
                 let _ = tx.send(JobResult::Failed(e));
             }
+        });
+
+        self.jobs.push(Job {
+            id,
+            rx,
+            progress: Progress::default(),
+            label,
+            finished: false,
+        });
+    }
+
+    /// 导出全图为 HTML（后台任务）。
+    ///
+    /// 大存档渲染一张图可能要好几分钟，必须放到后台线程，
+    /// 否则界面直接假死。进度通过 `ptx` 回报。
+    pub fn spawn_export_html(
+        &mut self,
+        world_root: PathBuf,
+        dims: Vec<String>,
+        out_path: PathBuf,
+        mode: mcworld_core::chunk::SliceMode,
+    ) {
+        let (tx, rx) = channel();
+        let id = self.next_id;
+        self.next_id += 1;
+        let ptx = self.tx_progress.clone();
+        let label = "导出全图 HTML".to_string();
+
+        std::thread::spawn(move || {
+            let mut cb = |dim: &str, done: usize, total: usize| {
+                let _ = ptx.send((
+                    id,
+                    Progress {
+                        done,
+                        total,
+                        message: format!("{dim} {done}/{total}"),
+                    },
+                ));
+            };
+            match crate::html_export::export_html(&world_root, &dims, &out_path, mode, &mut cb) {
+                Ok(msg) => {
+                    let _ = tx.send(JobResult::HtmlExported { message: msg });
+                }
+                Err(e) => {
+                    let _ = tx.send(JobResult::HtmlExportFailed { error: e });
+                }
+            }
+        });
+
+        self.jobs.push(Job {
+            id,
+            rx,
+            progress: Progress::default(),
+            label,
+            finished: false,
+        });
+    }
+
+    /// 保存某个维度的缩略图缓存（后台）。
+    ///
+    /// 采集该维度所有 region 的指纹，连同当前已渲染的缩略图一起落盘。
+    pub fn spawn_save_cache(
+        &mut self,
+        save_root: PathBuf,
+        dim_id: String,
+        dim_display: String,
+        region_dir: PathBuf,
+        slice: String,
+        data_version: i32,
+        tiles: Vec<((i32, i32), Vec<u8>)>,
+    ) {
+        let (tx, rx) = channel();
+        let id = self.next_id;
+        self.next_id += 1;
+        let label = format!("保存缓存 {dim_display}");
+
+        std::thread::spawn(move || {
+            let dir = crate::cache::save_cache_dir(&save_root).join(sanitize(&dim_id));
+            let stamps = crate::cache::collect_stamps(&region_dir);
+            let mut meta = crate::cache::CacheMeta {
+                dim_id,
+                slice,
+                data_version,
+                regions: stamps,
+                chunks: Vec::new(),
+            };
+            let mut data = Vec::with_capacity(tiles.len());
+            for (key, px) in tiles {
+                meta.chunks.push(key);
+                data.push(px);
+            }
+            match crate::cache::save(&dir, &meta, &data) {
+                Ok(()) => {
+                    let _ = tx.send(JobResult::CacheSaved {
+                        message: format!(
+                            "缓存已保存：{} 个区块 → {}",
+                            meta.chunks.len(),
+                            dir.display()
+                        ),
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(JobResult::CacheSaveFailed { error: e });
+                }
+            }
+        });
+
+        self.jobs.push(Job {
+            id,
+            rx,
+            progress: Progress::default(),
+            label,
+            finished: false,
+        });
+    }
+
+    /// 尝试读取某个维度的缩略图缓存（后台）。
+    ///
+    /// 会把缓存里的 region 指纹与磁盘当前状态对比，把"没变化的区块"
+    /// 和"需要重算的区块"分开返回。
+    pub fn spawn_load_cache(
+        &mut self,
+        save_root: PathBuf,
+        dim_id: String,
+        region_dir: PathBuf,
+        slice: String,
+        data_version: i32,
+    ) {
+        let (tx, rx) = channel();
+        let id = self.next_id;
+        self.next_id += 1;
+        let label = format!("读取缓存 {dim_id}");
+
+        std::thread::spawn(move || {
+            let dir = crate::cache::save_cache_dir(&save_root).join(sanitize(&dim_id));
+            let Some((meta, tiles)) = crate::cache::load(&dir) else {
+                // 没有缓存，静默返回（前端会走正常扫描）
+                return;
+            };
+
+            // 切片方式或数据版本变了 → 整份作废
+            if meta.slice != slice || meta.data_version != data_version {
+                return;
+            }
+
+            let now = crate::cache::collect_stamps(&region_dir);
+            let changed = meta.changed_regions(&now);
+
+            // 标记受影响的区块
+            let mut stale: Vec<(i32, i32)> = Vec::new();
+            let mut good: Vec<((i32, i32), Vec<u8>)> = Vec::new();
+            for (i, key) in meta.chunks.iter().enumerate() {
+                let (cx, cz) = *key;
+                let rx = cx.div_euclid(32);
+                let rz = cz.div_euclid(32);
+                if changed.iter().any(|(a, b)| *a == rx && *b == rz) {
+                    stale.push((cx, cz));
+                } else if let Some(px) = tiles.get(i) {
+                    good.push((*key, px.clone()));
+                }
+            }
+
+            let _ = tx.send(JobResult::CacheLoaded {
+                dimension: dim_id,
+                tiles: good,
+                stale,
+            });
         });
 
         self.jobs.push(Job {
@@ -819,4 +1010,12 @@ impl Job {
     pub fn id_of(&self) -> usize {
         0
     }
+}
+
+
+/// 把维度 id 变成安全的目录名：minecraft:overworld → minecraft_overworld
+fn sanitize(id: &str) -> String {
+    id.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
 }
