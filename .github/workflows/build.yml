@@ -101,8 +101,19 @@ jobs:
             libgl1-mesa-dev libxkbcommon-dev libwayland-dev \
             libxinerama-dev
 
+      # Windows 需要把图标资源链进 exe。
+      #
+      # `icon_obj.obj` 是手工构造的 COFF 对象（含 `.rsrc` 节），已在仓库里。
+      # 本机构建通过 `.cargo/config.local.toml` 的 link-arg 引入，但那个文件
+      # 不进 Git，所以 CI 必须在这里显式加 —— 否则发布出来的 exe 没有图标。
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --package mcworld-app
+        shell: bash
+        run: |
+          CFG="--config target.${{ matrix.target }}.rustflags=[]"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            CFG="--config target.${{ matrix.target }}.rustflags=[\"-C\",\"link-arg=crates/app/assets/icon_obj.obj\"]"
+          fi
+          cargo build --release --target ${{ matrix.target }} --package mcworld-app $CFG
 
       # Windows 上补齐 exe 图标的资源 RVA
       # （COFF 对象里的 OffsetToData 只能写节内偏移，链接后要补成全局 RVA）
@@ -111,11 +122,12 @@ jobs:
         shell: pwsh
         run: |
           $exe = "target/${{ matrix.target }}/release/${{ matrix.artifact }}"
-          if (Test-Path ".build/patch_rsrc_rva.js") {
-            node ".build/patch_rsrc_rva.js" $exe --write
-          } else {
-            Write-Host "patch script not present, skipping"
+          if (-not (Test-Path ".ci/patch_rsrc_rva.js")) {
+            throw "missing .ci/patch_rsrc_rva.js"
           }
+          node ".ci/patch_rsrc_rva.js" $exe --write
+          Write-Host "--- verify: no pending RVA fixes below means OK ---"
+          node ".ci/patch_rsrc_rva.js" $exe
 
       - name: Rename artifact
         shell: bash
