@@ -123,21 +123,20 @@ jobs:
           fi
           cargo build --release --target ${{ matrix.target }} --package mcworld-app $CFG
 
-      # Windows 上补齐 exe 图标的资源 RVA
-      # （COFF 对象里的 OffsetToData 只能写节内偏移，链接后要补成全局 RVA）
-      - name: Patch icon RVA (Windows)
+      # 校验资源是否齐全。
+      #
+      # 资源对象里带的是真正的 ADDR32NB 重定位，链接器会自己把
+      # OffsetToData 填成正确的全局 RVA，**不需要链接后再改 PE**。
+      # 所以这里只做断言：缺 .rsrc、缺版本信息、RVA 不对都直接让构建失败。
+      - name: Verify Windows resources
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: bash
         run: |
-          $exe = "target/${{ matrix.target }}/release/${{ matrix.artifact }}"
-          if (-not (Test-Path ".ci/patch_rsrc_rva.js")) {
-            throw "missing .ci/patch_rsrc_rva.js"
-          }
-          node ".ci/patch_rsrc_rva.js" $exe --write
-          Write-Host "--- verify: no pending RVA fixes below means OK ---"
-          node ".ci/patch_rsrc_rva.js" $exe
-          Write-Host "--- icon check ---"
-          node ".ci/check_icon.js" $exe
+          EXE="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
+          node .ci/patch_rsrc_rva.js "$EXE"
+          node .ci/check_icon.js "$EXE"
+          node .ci/check_resources.js "$EXE"
+          node .ci/check_version_info.js "$EXE"
 
       - name: Rename artifact
         shell: bash

@@ -1021,7 +1021,14 @@ impl App {
                     dimension,
                     tiles,
                     stale,
+                    hit,
                 } => {
+                    // 没有可用缓存：直接走常规扫描，别把视图标成"已采样"，
+                    // 否则首屏会既没有缩略图也不触发采样，一片黑。
+                    if !hit {
+                        self.request_viewport_sample(None);
+                        return;
+                    }
                     let reused = tiles.len();
                     let stale_n = stale.len();
                     if let Some(tab) = self.tab_mut() {

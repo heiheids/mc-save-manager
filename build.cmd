@@ -47,11 +47,10 @@ if "%~1"=="" (
 )
 set RC=%ERRORLEVEL%
 if %RC%==0 (
-    REM Icon resource patch: COFF DataEntry.OffsetToData can only hold a
-    REM section-relative offset. After linking we must add the .rsrc VA to
-    REM make it a valid global RVA, otherwise Windows cannot read the icon.
-    if exist "%ROOT%.ci\patch_rsrc_rva.js" (
-        node "%ROOT%.ci\patch_rsrc_rva.js" "%ROOT%target\x86_64-pc-windows-gnullvm\debug\mcworld-app.exe" --write
+    REM Resource check: the icon/version/manifest object now carries real
+    REM ADDR32NB relocations, so the linker fills in the correct RVAs and
+    REM no post-link patching is needed. Just verify they are all present.
+    if exist "%ROOT%.ci\check_resources.js" (
         node "%ROOT%.ci\check_resources.js" "%ROOT%target\x86_64-pc-windows-gnullvm\debug\mcworld-app.exe"
     )
 )

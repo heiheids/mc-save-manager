@@ -66,11 +66,16 @@ pub fn render_dimension(
     dim: &Dimension,
     mode: SliceMode,
     cached: &CachedChunks,
-    progress: &mut dyn FnMut(usize, usize),
+    progress: &mut dyn FnMut(&str, usize, usize),
 ) -> Result<DimImage, String> {
-    let metas = world
-        .scan_chunks(dim, &mut |_, _| {})
-        .map_err(|e| e.to_string())?;
+    // 扫描阶段也要报进度：8 万区块的存档光 scan_chunks 就要几分钟，
+    // 期间不给反馈的话界面上就是个不动的"准备中…"。
+    let metas = {
+        let mut sc = |done: usize, total: usize| progress("扫描区块", done, total);
+        world
+            .scan_chunks(dim, &mut sc)
+            .map_err(|e| e.to_string())?
+    };
     if metas.is_empty() {
         return Err(format!("{} 没有区块", dim.display));
     }
@@ -116,7 +121,7 @@ pub fn render_dimension(
 
     for (i, m) in metas.iter().enumerate() {
         if i % 32 == 0 {
-            progress(i, total);
+            progress("渲染区块", i, total);
         }
 
         let bx = ((m.x - min_x) as u32) * tile as u32;
@@ -191,7 +196,7 @@ pub fn render_dimension(
         }
     }
 
-    progress(total, total);
+    progress("渲染区块", total, total);
 
     Ok(DimImage {
         dim_id: dim.id.clone(),
@@ -650,8 +655,8 @@ pub fn export_html(
         progress(&format!("读取缓存 · {}", dim.display), 0, 1);
         let cached = load_usable_cache(world_root, dim, &slice, data_version);
 
-        let mut cb = |done: usize, total: usize| {
-            progress(&dim.display, done, total);
+        let mut cb = |phase: &str, done: usize, total: usize| {
+            progress(&format!("{} {}", dim.display, phase), done, total);
         };
         let img = render_dimension(&world, dim, mode, &cached, &mut cb)?;
         total_reused += img.reused;

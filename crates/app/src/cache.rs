@@ -381,6 +381,7 @@ mod tests {
     #[test]
     fn json_roundtrip() {
         let meta = CacheMeta {
+            format_version: FORMAT_VERSION,
             dim_id: "minecraft:overworld".into(),
             slice: "surface".into(),
             data_version: 3955,
@@ -394,9 +395,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let tiles: Vec<Vec<u8>> = (0..3).map(|i| vec![i as u8; TILE_BYTES]).collect();
-        save(&dir, &meta, &tiles).unwrap();
+        let biomes: Vec<Option<String>> = vec![Some("minecraft:plains".into()), None, None];
+        save(&dir, &meta, &tiles, &biomes).unwrap();
 
-        let (got, got_tiles) = load(&dir).expect("应当能读回");
+        let (got, got_tiles, got_biomes) = load(&dir).expect("应当能读回");
         assert_eq!(got.dim_id, meta.dim_id);
         assert_eq!(got.data_version, meta.data_version);
         assert_eq!(got.regions.len(), 2);
@@ -404,6 +406,9 @@ mod tests {
         assert_eq!(got.chunks, meta.chunks);
         assert_eq!(got_tiles.len(), 3);
         assert_eq!(got_tiles[2][0], 2);
+        // 群系也要能原样读回
+        assert_eq!(got_biomes[0].as_deref(), Some("minecraft:plains"));
+        assert_eq!(got_biomes[1], None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -306,11 +306,21 @@ for (const t of types) {
   }
 }
 
-// 数据项：OffsetToData 先写**节内偏移**，链接后由 patch_rsrc_rva.js 加上 .rsrc 的 VA
+// 数据项。
+//
+// OffsetToData 必须是**全局 RVA**，但目标文件不知道自己的虚拟地址。
+// 这里给它加一条 IMAGE_REL_AMD64_ADDR32NB 重定位，让链接器回填 ——
+// 这样链接完就是对的，不需要事后用脚本改 PE。
+//
+// （早期做法是不加重定位、链接后手工把节内偏移改成 RVA。那个办法能用，
+//   但任何没跑修补脚本的产物都是坏 PE —— 比如 `cargo test` 出来的测试
+//   程序，Windows 直接报"不是有效的 Win32 应用程序"。）
 let deOff = dirsSize;
+const relocs = [];
 for (const t of types) {
   for (const it of t.items) {
-    buf.writeUInt32LE(it.offset, deOff); // OffsetToData（节内偏移）
+    relocs.push(deOff); // 这 4 字节要被重定位成 RVA
+    buf.writeUInt32LE(it.offset, deOff); // 先填节内偏移（重定位的初值）
     buf.writeUInt32LE(it.blob.length, deOff + 4); // Size
     buf.writeUInt32LE(0, deOff + 8); // CodePage
     buf.writeUInt32LE(0, deOff + 12); // Reserved
@@ -331,9 +341,11 @@ for (const t of types) {
 
 const HEADER = 20;
 const SECTION = 40;
+const RELOC = 10;
 const SYM = 18;
 const symCount = 2;
-const symTableOff = HEADER + SECTION;
+const relocTableOff = HEADER + SECTION;
+const symTableOff = relocTableOff + relocs.length * RELOC;
 const strTableOff = symTableOff + symCount * SYM;
 const dataOff = strTableOff + 4;
 
@@ -355,11 +367,21 @@ out.writeUInt32LE(buf.length, p); p += 4; // VirtualSize
 out.writeUInt32LE(0, p); p += 4; // VirtualAddress
 out.writeUInt32LE(buf.length, p); p += 4; // SizeOfRawData
 out.writeUInt32LE(dataOff, p); p += 4; // PointerToRawData
-out.writeUInt32LE(0, p); p += 4; // PointerToRelocations
+out.writeUInt32LE(relocs.length > 0 ? relocTableOff : 0, p); p += 4; // PointerToRelocations
 out.writeUInt32LE(0, p); p += 4; // PointerToLinenumbers
-out.writeUInt16LE(0, p); p += 2; // NumberOfRelocations
+out.writeUInt16LE(relocs.length, p); p += 2; // NumberOfRelocations
 out.writeUInt16LE(0, p); p += 2; // NumberOfLinenumbers
 out.writeUInt32LE(0x40000040, p); p += 4; // INITIALIZED_DATA | MEM_READ
+
+// 重定位表：每条 IMAGE_RELOCATION
+//   VirtualAddress(4) SymbolTableIndex(4) Type(2)
+// SymbolTableIndex 指向下面的 .rsrc SECTION 符号（索引 0）。
+// 早期实现写 0 也能指到它，但 lld 对某些写法会崩，这里显式写 0（即第 0 项）。
+for (const r of relocs) {
+  out.writeUInt32LE(r, p); p += 4;
+  out.writeUInt32LE(0, p); p += 4;
+  out.writeUInt16LE(0x0003, p); p += 2; // IMAGE_REL_AMD64_ADDR32NB
+}
 
 // 符号表第 0 项：SECTION 符号（名字内联）
 Buffer.from('.rsrc\0\0\0', 'ascii').copy(out, p); p += 8;
@@ -371,7 +393,7 @@ out.writeUInt8(1, p); p += 1; // NumberOfAuxSymbols = 1
 
 // 第 1 项：aux 记录，**必须正好 18 字节**
 out.writeUInt32LE(buf.length, p); p += 4; // Length
-out.writeUInt16LE(0, p); p += 2; // NumberOfRelocations
+out.writeUInt16LE(relocs.length, p); p += 2; // NumberOfRelocations
 out.writeUInt16LE(0, p); p += 2; // NumberOfLinenumbers
 out.writeUInt32LE(0, p); p += 4; // CheckSum
 out.writeUInt16LE(1, p); p += 2; // Number
@@ -390,4 +412,5 @@ fs.writeFileSync(outPath, out);
 console.log(`写出 ${outPath}`);
 console.log(`  .rsrc ${buf.length} 字节（对齐后 ${totalLen}）`);
 console.log(`  资源: RT_ICON x${images.length}, RT_GROUP_ICON, RT_VERSION(${versionBlob.length}B), RT_MANIFEST(${manifestBlob.length}B)`);
+console.log(`  重定位 ${relocs.length} 条（ADDR32NB，由链接器回填 RVA）`);
 console.log(`  版本 ${vA}.${vB}.${vC}.${vD}`);

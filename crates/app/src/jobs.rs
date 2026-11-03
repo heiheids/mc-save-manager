@@ -40,6 +40,11 @@ pub enum JobResult {
         tiles: Vec<((i32, i32), Vec<u8>)>,
         /// 因 region 变化而需要重新采样的区块
         stale: Vec<(i32, i32)>,
+        /// 是否真的命中了一份可用缓存。
+        ///
+        /// 没命中时也必须回一条结果（hit = false），否则任务永远停在
+        /// "未完成"状态，「处理中」浮窗会一直挂在屏幕上。
+        hit: bool,
     },
     /// 扫描完成：区块元数据 + 实体 + 方块实体
     Scanned {
@@ -141,18 +146,21 @@ impl Jobs {
 
         let mut out = Vec::new();
         for job in self.jobs.iter_mut() {
+            // 每个任务只会发**一条**最终结果（见各 spawn_xxx 的结尾），
+            // 所以收到任何一条就说明它已经结束了。
+            //
+            // 这里以前只在 `Failed` 分支里置 finished，于是**成功完成的
+            // 任务永远不会被清掉**：`is_busy()` 一直是 true、界面一直按
+            // 120ms 重绘，而「处理中」浮窗会永久挂在屏幕上 ——
+            // 用户看到的就是一个卡在"读取缓存 xxx / 准备中…"的框，
+            // 明明缓存早就读完了。
             while let Ok(msg) = job.rx.try_recv() {
-                match msg {
-                    JobResult::Failed(_) => {
-                        job.finished = true;
-                        out.push(msg);
-                    }
-                    other => out.push(other),
-                }
+                job.finished = true;
+                out.push(msg);
             }
         }
-        // 清理已完成且队列已空的
-        self.jobs.retain(|j| !j.finished || !j.rx.try_recv().is_err());
+        // 结果已经全部收走，完成的任务可以直接移出列表
+        self.jobs.retain(|j| !j.finished);
         out
     }
 
@@ -527,14 +535,34 @@ impl Jobs {
         let label = format!("读取缓存 {dim_id}");
 
         std::thread::spawn(move || {
+            // 没有缓存时**也必须回一条结果**。
+            //
+            // 之前这里直接 `return`，tx 被丢弃，接收端永远收不到东西，
+            // 任务就一直是"未完成"：is_busy() 恒为真、界面恒定重绘，
+            // 而「处理中」浮窗会永久显示"读取缓存 xxx / 准备中…"。
+            // 用户把程序复制到新目录（那里没有 地图缓存/）后一打开存档
+            // 就能看到这个卡住的框。
             let dir = crate::cache::save_cache_dir(&save_root).join(sanitize(&dim_id));
-            let Some((meta, tiles, _biomes)) = crate::cache::load(&dir) else {
-                // 没有缓存，静默返回（前端会走正常扫描）
+            let loaded = crate::cache::load(&dir);
+
+            let Some((meta, tiles, _biomes)) = loaded else {
+                let _ = tx.send(JobResult::CacheLoaded {
+                    dimension: dim_id,
+                    tiles: Vec::new(),
+                    stale: Vec::new(),
+                    hit: false,
+                });
                 return;
             };
 
             // 切片方式或数据版本变了 → 整份作废
             if meta.slice != slice || meta.data_version != data_version {
+                let _ = tx.send(JobResult::CacheLoaded {
+                    dimension: dim_id,
+                    tiles: Vec::new(),
+                    stale: Vec::new(),
+                    hit: false,
+                });
                 return;
             }
 
@@ -559,6 +587,7 @@ impl Jobs {
                 dimension: dim_id,
                 tiles: good,
                 stale,
+                hit: true,
             });
         });
 
@@ -1021,4 +1050,82 @@ fn sanitize(id: &str) -> String {
     id.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect()
+}
+
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    /// 等任务结束（最多 3 秒），期间反复 poll。
+    fn drain(jobs: &mut Jobs) -> Vec<JobResult> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut got = Vec::new();
+        while std::time::Instant::now() < deadline {
+            got.extend(jobs.poll());
+            if !jobs.is_busy() {
+                return got;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        got
+    }
+
+    /// 没有缓存时，任务必须**照样回一条结果**并结束。
+    ///
+    /// 这正是"把程序复制到新目录后，浮窗卡在读取缓存"那个 bug：
+    /// 缓存不存在时 spawn_load_cache 直接 return，一条结果都不发，
+    /// 任务永远不结束 —— is_busy() 恒真、浮窗永远挂着。
+    #[test]
+    fn load_cache_without_cache_still_finishes() {
+        let mut jobs = Jobs::default();
+        let tmp = std::env::temp_dir().join("mcworld_test_no_cache_dir");
+        let _ = std::fs::create_dir_all(&tmp);
+
+        jobs.spawn_load_cache(
+            tmp.clone(),
+            "minecraft:overworld".to_string(),
+            tmp.join("region"),
+            "surface".to_string(),
+            1234,
+        );
+
+        assert!(jobs.is_busy(), "刚提交应当处于忙碌状态");
+
+        let results = drain(&mut jobs);
+
+        assert!(!jobs.is_busy(), "任务结束后不应再忙碌");
+        assert!(
+            jobs.labels().is_empty(),
+            "任务结束后不应还留在 labels() 里，否则浮窗不会消失"
+        );
+        assert_eq!(results.len(), 1, "应当恰好回一条结果");
+        match &results[0] {
+            JobResult::CacheLoaded { hit, tiles, .. } => {
+                assert!(!hit, "没有缓存时 hit 应为 false");
+                assert!(tiles.is_empty());
+            }
+            _ => panic!("结果类型不对，应当是 CacheLoaded"),
+        }
+    }
+
+    /// 成功完成的任务必须被清理，不能永远留在列表里。
+    #[test]
+    fn finished_jobs_are_removed() {
+        let mut jobs = Jobs::default();
+        let tmp = std::env::temp_dir().join("mcworld_test_no_cache_dir2");
+        let _ = std::fs::create_dir_all(&tmp);
+
+        jobs.spawn_load_cache(
+            tmp,
+            "minecraft:the_end".to_string(),
+            std::path::PathBuf::from("/nonexistent/region"),
+            "surface".to_string(),
+            0,
+        );
+
+        let _ = drain(&mut jobs);
+        assert!(!jobs.is_busy());
+        assert!(jobs.jobs.is_empty(), "完成的任务应当从列表里移除");
+    }
 }

@@ -2794,21 +2794,24 @@ fn export_progress_window(app: &mut App, ctx: &egui::Context) {
         .anchor(egui::Align2::CENTER_TOP, egui::Vec2::new(0.0, 90.0))
         .show(ctx, |ui| {
             ui.set_min_width(360.0);
-            ui.label(RichText::new(label.clone()).strong());
+            ui.label(RichText::new(job_title(label)).strong());
+            ui.add_space(2.0);
+            ui.label(
+                RichText::new(label.clone())
+                    .size(11.5)
+                    .color(theme::TEXT_DIM),
+            );
             ui.add_space(6.0);
 
             ui.add(
                 egui::ProgressBar::new(frac)
                     .desired_width(340.0)
-                    .text(if prog.total > 0 {
-                        format!(
-                            "{}  ·  {}/{}",
-                            if prog.message.is_empty() { "-" } else { &prog.message },
-                            prog.done,
-                            prog.total
-                        )
-                    } else if prog.message.is_empty() {
-                        "准备中…".to_string()
+                    .text(if prog.message.is_empty() {
+                        // 任务还没发出第一条进度。给个更具体的说明，
+                        // 而不是干巴巴的"准备中…"。
+                        format!("{label} · 准备中")
+                    } else if prog.total > 0 {
+                        format!("{}  {:.0}%", prog.message, frac * 100.0)
                     } else {
                         prog.message.clone()
                     }),
@@ -2824,4 +2827,18 @@ fn export_progress_window(app: &mut App, ctx: &egui::Context) {
 
     // 保持刷新，让进度条动起来
     ctx.request_repaint_after(std::time::Duration::from_millis(120));
+}
+
+
+/// 把内部任务名翻译成给人看的一句话。
+fn job_title(label: &str) -> String {
+    if label.starts_with("读取缓存") {
+        "读取缩略图缓存".into()
+    } else if label.starts_with("保存缓存") {
+        "保存缩略图缓存".into()
+    } else if label.contains("导出") {
+        "导出全图 HTML".into()
+    } else {
+        label.to_string()
+    }
 }
