@@ -10,7 +10,7 @@
 > level without needing the game running. Supports **1.21.1** through
 > **26.4 snapshots**. [Jump to English](#english)
 
-![版本](https://img.shields.io/badge/version-1.0.1-brightgreen)
+![版本](https://img.shields.io/badge/version-1.0.2-brightgreen)
 ![协议](https://img.shields.io/badge/license-GPL--3.0-blue)
 
 **中文** | [English](#english)
@@ -47,8 +47,25 @@
 |---|---|
 | `.litematic` | Litematica 结构文件（只存非空气方块） |
 | `.smclip` | [SwiftMap](https://github.com/heiheids) 剪贴板格式（完整快照，含空气/群系/实体，最多 7×7 区块） |
+| `.html` | **全图网页**：整个维度渲染成一张图，浏览器里缩放查看，鼠标显示坐标与群系 |
 
 多选区导出时自动追加 `_1`、`_2`、`_3` 序号。
+
+**为什么全图要导出成网页而不是在程序里看**：实测 26.3 存档主世界有 82419 个区块，
+全图缩放下每区块不足 1 像素，而且每次拖动都要重新排队上万个区块。
+导出成 HTML 后由浏览器负责缩放，流畅得多，而且可以把文件发给别人或留档。
+导出的网页是单个自包含文件（贴图以 base64 内嵌），不依赖本程序。
+
+### 大存档与缓存
+
+存档区块数超过 **2000** 时，打开时会提示保存缩略图缓存。
+
+- 缓存保存每个区块的 16×16 缩略图，以及各 region 文件的（大小、修改时间）
+- 下次打开先读缓存，只重算 region 文件确实变过的部分
+- 存放位置：`<程序目录>/地图缓存/<存档名>_<路径hash>/<维度>/`
+- 切片方式或存档 DataVersion 变了，整份缓存自动作废
+
+实测 8 万区块的存档，第二次打开基本秒开。
 
 ### 安全
 
@@ -199,7 +216,7 @@ A Minecraft save editor written in Rust. It edits the world directly at the
 save-file level — no need for the game to be running. Supports **1.21.1**
 through **26.4 snapshots**.
 
-![version](https://img.shields.io/badge/version-1.0.1-brightgreen)
+![version](https://img.shields.io/badge/version-1.0.2-brightgreen)
 ![license](https://img.shields.io/badge/license-GPL--3.0-blue)
 
 ---
@@ -238,8 +255,31 @@ through **26.4 snapshots**.
 |---|---|
 | `.litematic` | Litematica schematic (stores non-air blocks only) |
 | `.smclip` | [SwiftMap](https://github.com/heiheids) clipboard format (full snapshot incl. air / biomes / entities, max 7×7 chunks) |
+| `.html` | **Full-map web page**: renders an entire dimension into one image; zoom in the browser, hover for coordinates and biome |
 
 With multiple selections, `_1`, `_2`, `_3` suffixes are appended automatically.
+
+**Why export the full map to HTML instead of viewing it in-app**: a real 26.3 save
+had 82,419 chunks in the Overworld. At full-map zoom each chunk is under one pixel,
+and every pan re-queues tens of thousands of chunks. Exporting to HTML lets the
+browser handle zooming, which is far smoother — and the file can be shared or archived.
+The output is a single self-contained file (textures embedded as base64) that does
+not require this program.
+
+### Large saves and caching
+
+When a dimension has more than **2000** chunks, the program offers to save a
+thumbnail cache on open.
+
+- The cache stores each chunk's 16×16 thumbnail plus each region file's
+  (size, modification time)
+- On the next open the cache is read first, and only region files that actually
+  changed are re-sampled
+- Location: `<exe dir>/地图缓存/<save name>_<path hash>/<dimension>/`
+- The cache is discarded automatically if the slice mode or the save's
+  DataVersion changes
+
+A save with 82k chunks opens almost instantly the second time.
 
 ### Safety
 
