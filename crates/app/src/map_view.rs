@@ -272,10 +272,25 @@ impl Default for MapCamera {
 impl MapCamera {
     /// 最小缩放。
     ///
-    /// 必须允许很小：大存档（8 万区块、跨度 4.7 万方块）要装进约 1400 像素的
-    /// 画布，需要 0.03 以下。「全图」依赖这个下限能到 0.002。
-    pub const MIN_SCALE: f32 = 0.002;
+    /// 缩放下限。
+    ///
+    /// 曾经是 0.002（为已移除的「全图」留的余量）。实测在 0.002 时，
+    /// 区块间距只有 0.002×16 = 0.032 像素 —— 整张地图缩成中心一个几十像素的
+    /// 色块，既看不出内容，又要为几万个区块各画一个矩形，白白消耗性能。
+    ///
+    /// 0.03 对应区块间距 0.48 像素：刚好还能看出大致轮廓（矩形按 1 像素画，
+    /// 相邻区块重叠约 2 倍），1994 区块宽的存档会占约 960 像素，正好一屏。
+    /// 再大的范围请用「导出全图」。
+    pub const MIN_SCALE: f32 = 0.03;
     pub const MAX_SCALE: f32 = 24.0;
+
+    /// 世界坐标的合理范围。Minecraft 世界边界是 ±30,000,000 方块，
+    /// 留一点余量。
+    ///
+    /// 限制它的原因：以光标为锚点缩放时，中心会按"锚点偏移 / 缩放比"移动。
+    /// 反复在角落缩放会让中心漂到极大值，接着 `as i32` 饱和成边界值，
+    /// 再参与加减就可能在 debug 构建里溢出 panic。
+    pub const MAX_WORLD: f32 = 33_000_000.0;
 
     pub fn zoom_by(&mut self, factor: f32, anchor: Pos2, viewport: Rect) {
         let before = self.screen_to_world(anchor, viewport);
@@ -283,6 +298,20 @@ impl MapCamera {
         let after = self.screen_to_world(anchor, viewport);
         // 保持鼠标下的世界坐标不动
         self.center += before - after;
+        self.clamp_center();
+    }
+
+    /// 把相机中心限制在合法世界范围内，顺便挡掉 NaN / inf。
+    pub fn clamp_center(&mut self) {
+        let fix = |v: f32| -> f32 {
+            if v.is_finite() {
+                v.clamp(-Self::MAX_WORLD, Self::MAX_WORLD)
+            } else {
+                0.0
+            }
+        };
+        self.center.x = fix(self.center.x);
+        self.center.y = fix(self.center.y);
     }
 
     pub fn screen_to_world(&self, p: Pos2, viewport: Rect) -> Vec2 {
@@ -408,6 +437,7 @@ pub fn draw(
     {
         let d = response.drag_delta();
         cam.center -= Vec2::new(d.x, d.y) / cam.scale;
+        cam.clamp_center();
     }
 
     // ---- 缩放 ----
@@ -478,12 +508,14 @@ pub fn draw(
     // 还没采样的区域：只在**放大到足够近**时才画占位格。
     // 缩得很小时画占位没有意义（一片糊），反而浪费绘制调用。
     if chunk_px >= 4.0 {
-        let cx0 = (visible.min.x / 16.0).floor() as i32 - 1;
-        let cx1 = (visible.max.x / 16.0).ceil() as i32 + 1;
-        let cz0 = (visible.min.y / 16.0).floor() as i32 - 1;
-        let cz1 = (visible.max.y / 16.0).ceil() as i32 + 1;
+        // 饱和运算 + i64 计算格数：极端缩放下 `as i32` 会贴到边界值，
+        // 再相减在 debug 构建里会溢出 panic。
+        let cx0 = ((visible.min.x / 16.0).floor() as i32).saturating_sub(1);
+        let cx1 = ((visible.max.x / 16.0).ceil() as i32).saturating_add(1);
+        let cz0 = ((visible.min.y / 16.0).floor() as i32).saturating_sub(1);
+        let cz1 = ((visible.max.y / 16.0).ceil() as i32).saturating_add(1);
         // 再兜一层保险：限制单帧占位格数量
-        let cells = ((cx1 - cx0 + 1) as i64) * ((cz1 - cz0 + 1) as i64);
+        let cells = (cx1 as i64 - cx0 as i64 + 1) * (cz1 as i64 - cz0 as i64 + 1);
         if cells <= 20_000 {
             for cx in cx0..=cx1 {
                 for cz in cz0..=cz1 {
@@ -514,17 +546,22 @@ pub fn draw(
         };
         let grid = Stroke::new(1.0, color);
         // 网格线只在可见范围内画；缩得极小时线距不足 1 像素，直接跳过
-        let gx0 = (visible.min.x / 16.0).floor() as i32;
-        let gx1 = (visible.max.x / 16.0).ceil() as i32;
-        let gz0 = (visible.min.y / 16.0).floor() as i32;
-        let gz1 = (visible.max.y / 16.0).ceil() as i32;
-        for cx in gx0..=gx1 {
-            let x = cam.world_to_screen(Vec2::new(cx as f32 * 16.0, 0.0), rect).x;
-            painter.line_segment([Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)], grid);
-        }
-        for cz in gz0..=gz1 {
-            let y = cam.world_to_screen(Vec2::new(0.0, cz as f32 * 16.0), rect).y;
-            painter.line_segment([Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)], grid);
+        let gx0 = ((visible.min.x / 16.0).floor() as i32).clamp(-1_000_000, 1_000_000);
+        let gx1 = ((visible.max.x / 16.0).ceil() as i32).clamp(-1_000_000, 1_000_000);
+        let gz0 = ((visible.min.y / 16.0).floor() as i32).clamp(-1_000_000, 1_000_000);
+        let gz1 = ((visible.max.y / 16.0).ceil() as i32).clamp(-1_000_000, 1_000_000);
+        // 缩得很小时线距不足 1 像素，画出来只是一片糊，而且数量可能上万。
+        // 这里限制总条数，超出就整块跳过。
+        let lines = (gx1 as i64 - gx0 as i64 + 1) + (gz1 as i64 - gz0 as i64 + 1);
+        if lines <= 4000 {
+            for cx in gx0..=gx1 {
+                let x = cam.world_to_screen(Vec2::new(cx as f32 * 16.0, 0.0), rect).x;
+                painter.line_segment([Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)], grid);
+            }
+            for cz in gz0..=gz1 {
+                let y = cam.world_to_screen(Vec2::new(0.0, cz as f32 * 16.0), rect).y;
+                painter.line_segment([Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)], grid);
+            }
         }
     }
 

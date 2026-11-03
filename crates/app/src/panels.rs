@@ -1337,8 +1337,15 @@ pub fn map_area(app: &mut App, ctx: &egui::Context) {
                 }
             }
 
-            // 相机被拖动 / 缩放后，把视野内还没采样的区块排进队列。
-            // 只在中心移动超过 2 个区块时才重新计算，避免每帧遍历。
+            // 决定本帧要不要再为视口补载区块。
+            //
+            // 三种情况需要补：
+            //   1. 相机中心移动超过 2 个区块（拖动 / 跳转）
+            //   2. 缩放比例变了 —— 缩小之后视野内会露出大量没加载的区块，
+            //      而中心没动。早期只看中心位移，缩小时完全不补载，
+            //      表现就是"缩小后地图空着，转半天也不出来"。
+            //   3. 上一批已经快处理完，但还没加载完 —— 否则一次最多只排
+            //      1024 个，剩下的永远等不到下一次触发。
             {
                 let cam_center = v.camera.center;
                 let cur = (
@@ -1349,8 +1356,17 @@ pub fn map_area(app: &mut App, ctx: &egui::Context) {
                     Some(prev) => (prev.0 - cur.0).abs() >= 2 || (prev.1 - cur.1).abs() >= 2,
                     None => true,
                 };
-                if moved {
+                // 缩放变化超过 1% 就认为视野范围变了
+                let zoom_changed = match v.last_view_scale {
+                    Some(prev) => ((prev - v.camera.scale) / prev.max(1e-6)).abs() > 0.01,
+                    None => true,
+                };
+                // 队列快空了但还在加载 → 补下一批（阈值留出余量，避免频繁触发）
+                let top_up = v.loading && v.pending.len() < 256;
+
+                if moved || zoom_changed || top_up {
                     v.last_view_center = Some(cur);
+                    v.last_view_scale = Some(v.camera.scale);
                     viewport_needs_load = true;
                 }
             }

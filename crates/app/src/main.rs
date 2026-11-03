@@ -67,6 +67,11 @@ pub struct DimView {
     pub pending: std::collections::HashSet<(i32, i32)>,
     /// 上一次触发加载时的视口中心（区块坐标），用于判断"是否需要重新排队列"。
     pub last_view_center: Option<(i32, i32)>,
+    /// 上一次触发加载时的缩放比例。
+    ///
+    /// 缩小视野后中心可能完全不动，但可见区块会多出好几倍 ——
+    /// 只看中心位移会漏掉这种情况。
+    pub last_view_scale: Option<f32>,
     /// 当前是否还有区块在加载（用于显示"加载中"）。
     pub loading: bool,
     /// 是否已完成一次全图（或大范围）加载。
@@ -96,6 +101,7 @@ impl Default for DimView {
             sampled: false,
             pending: Default::default(),
             last_view_center: None,
+            last_view_scale: None,
             loading: false,
             full_loaded: false,
             expand_stage: 0,
@@ -656,10 +662,13 @@ impl App {
         let min_bz = cam.center.y - half_h;
         let max_bz = cam.center.y + half_h;
 
-        let cx0 = (min_bx / 16.0).floor() as i32 - margin;
-        let cz0 = (min_bz / 16.0).floor() as i32 - margin;
-        let cx1 = (max_bx / 16.0).floor() as i32 + margin;
-        let cz1 = (max_bz / 16.0).floor() as i32 + margin;
+        // 用饱和运算：缩到最小（0.002）且相机漂得很远时，
+        // `as i32` 会落到边界值，再 ± margin 在 debug 构建里会 panic，
+        // 表现就是"滚轮缩放时程序直接消失"。
+        let cx0 = ((min_bx / 16.0).floor() as i32).saturating_sub(margin);
+        let cz0 = ((min_bz / 16.0).floor() as i32).saturating_sub(margin);
+        let cx1 = ((max_bx / 16.0).floor() as i32).saturating_add(margin);
+        let cz1 = ((max_bz / 16.0).floor() as i32).saturating_add(margin);
         (cx0, cz0, cx1, cz1)
     }
 
@@ -724,6 +733,19 @@ impl App {
         // 导致这一帧卡住。剩下的下一帧会继续补，表现为"分批出现"。
         const MAX_PER_BATCH: usize = 1024;
         if need.len() > MAX_PER_BATCH {
+            // ★ 按到视口中心的距离排序后再截断。
+            //
+            //   不排的话就是按区块索引的原始顺序取前 1024 个 ——
+            //   缩小到能看到几万个区块时，最先加载的是世界最北边那一排，
+            //   而用户盯着的是屏幕中间，于是"看着的地方半天不出来，
+            //   边缘倒先亮了"。
+            let cx_mid = (cx0 as i64 + cx1 as i64) / 2;
+            let cz_mid = (cz0 as i64 + cz1 as i64) / 2;
+            need.sort_by_key(|(x, z)| {
+                let dx = *x as i64 - cx_mid;
+                let dz = *z as i64 - cz_mid;
+                dx * dx + dz * dz
+            });
             need.truncate(MAX_PER_BATCH);
         }
 
@@ -1385,7 +1407,51 @@ fn window_icon() -> egui::IconData {
     }
 }
 
+/// 把 panic 信息写到程序目录下的 `崩溃日志.txt`。
+///
+/// 这个程序用 `--subsystem windows` 链接，没有控制台，
+/// 一旦 panic 就是"窗口直接消失"，用户完全看不到原因。
+/// 写一份日志至少能让下一次崩溃有据可查。
+///
+/// 保留默认 hook，所以调试运行时终端里仍然能看到完整 backtrace。
+fn install_panic_log() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let path = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_default()
+            .join("崩溃日志.txt");
+
+        let mut text = String::new();
+        text.push_str("=== Minecraft 存档管理器 崩溃报告 ===\n");
+        if let Ok(t) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            text.push_str(&format!("时间戳: {}\n", t.as_secs()));
+        }
+        text.push_str(&format!("版本: {}\n", env!("CARGO_PKG_VERSION")));
+        text.push_str(&format!("\n{}\n", info));
+        if let Some(loc) = info.location() {
+            text.push_str(&format!("位置: {}:{}:{}\n", loc.file(), loc.line(), loc.column()));
+        }
+        text.push_str("\n--- backtrace ---\n");
+        text.push_str(&std::backtrace::Backtrace::force_capture().to_string());
+
+        // 追加而不是覆盖：连续崩几次时，最早的现场更有价值
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "{text}\n");
+        }
+
+        prev(info);
+    }));
+}
+
 fn main() -> eframe::Result<()> {
+    install_panic_log();
     // 无界面导出模式：
     //   mcworld-app <存档路径> --export-html <输出.html> [维度id ...]
     //

@@ -10,7 +10,7 @@
 > level without needing the game running. Supports **1.21.1** through
 > **26.4 snapshots**. [Jump to English](#english)
 
-![版本](https://img.shields.io/badge/version-1.0.5-brightgreen)
+![版本](https://img.shields.io/badge/version-1.0.6-brightgreen)
 ![协议](https://img.shields.io/badge/license-GPL--3.0-blue)
 
 **中文** | [English](#english)
@@ -247,7 +247,7 @@ A Minecraft save editor written in Rust. It edits the world directly at the
 save-file level — no need for the game to be running. Supports **1.21.1**
 through **26.4 snapshots**.
 
-![version](https://img.shields.io/badge/version-1.0.5-brightgreen)
+![version](https://img.shields.io/badge/version-1.0.6-brightgreen)
 ![license](https://img.shields.io/badge/license-GPL--3.0-blue)
 
 ---

@@ -146,20 +146,31 @@ impl Jobs {
 
         let mut out = Vec::new();
         for job in self.jobs.iter_mut() {
-            // 每个任务只会发**一条**最终结果（见各 spawn_xxx 的结尾），
-            // 所以收到任何一条就说明它已经结束了。
+            // ★ 判断任务结束的条件是**发送端断开**，不是"收到过消息"。
             //
-            // 这里以前只在 `Failed` 分支里置 finished，于是**成功完成的
-            // 任务永远不会被清掉**：`is_busy()` 一直是 true、界面一直按
-            // 120ms 重绘，而「处理中」浮窗会永久挂在屏幕上 ——
-            // 用户看到的就是一个卡在"读取缓存 xxx / 准备中…"的框，
-            // 明明缓存早就读完了。
-            while let Ok(msg) = job.rx.try_recv() {
-                job.finished = true;
-                out.push(msg);
+            //   采样任务（spawn_sample）一条任务会分批发很多条 `Sampled`
+            //   消息（每 128 个有数据的区块一条、每 256 个空区块一条）。
+            //   如果收到第一条就把任务标记完成并移出列表，后面那些批次
+            //   就再也送不到了 —— 它们对应的区块会永远留在 `pending` 里，
+            //   界面一直显示"加载中… 剩余 N 个区块"却再也不动。
+            //
+            //   反过来，如果像更早的版本那样只在 `Failed` 时置 finished，
+            //   成功完成的任务又永远清不掉，`is_busy()` 恒真、「处理中」
+            //   浮窗永久挂着。两种都得避开，所以只能靠通道状态判断。
+            loop {
+                match job.rx.try_recv() {
+                    Ok(msg) => out.push(msg),
+                    // 暂时没有消息，但发送端还活着 —— 任务没结束，先留着
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    // 发送端已释放：该发的都发完了，任务真正结束
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        job.finished = true;
+                        break;
+                    }
+                }
             }
         }
-        // 结果已经全部收走，完成的任务可以直接移出列表
+        // 结果已经全部收走，结束的任务移出列表
         self.jobs.retain(|j| !j.finished);
         out
     }
@@ -1107,6 +1118,48 @@ mod lifecycle_tests {
             }
             _ => panic!("结果类型不对，应当是 CacheLoaded"),
         }
+    }
+
+    /// 一条任务发多条消息时，必须把所有消息都收完才清理。
+    ///
+    /// 这正是"加载卡在 剩余 N 个区块"那个 bug：采样任务会分批发很多条
+    /// `Sampled`，早期实现收到第一条就把任务移出列表，后面的批次全部丢失，
+    /// 对应的区块永远留在 pending 里。
+    #[test]
+    fn multi_message_job_is_not_finished_early() {
+        let mut jobs = Jobs::default();
+        let (tx, rx) = channel();
+        jobs.jobs.push(Job {
+            id: 999,
+            rx,
+            progress: Progress::default(),
+            label: "fake".into(),
+            finished: false,
+        });
+
+        // 第一批发完，发送端仍然活着
+        for i in 0..3 {
+            tx.send(JobResult::Info(format!("d{i}")))
+            .unwrap();
+        }
+        let got = jobs.poll();
+        assert_eq!(got.len(), 3, "应当收到 3 条");
+        assert!(jobs.is_busy(), "发送端还活着，任务不应算结束");
+
+        // 再来一批
+        for i in 0..2 {
+            tx.send(JobResult::Info(format!("e{i}")))
+            .unwrap();
+        }
+        let got2 = jobs.poll();
+        assert_eq!(got2.len(), 2, "后到的消息也要收到");
+        assert!(jobs.is_busy(), "仍然不应结束");
+
+        // 发送端释放后才算结束
+        drop(tx);
+        let _ = jobs.poll();
+        assert!(!jobs.is_busy(), "发送端断开后任务应结束");
+        assert!(jobs.jobs.is_empty(), "结束的任务应被移出列表");
     }
 
     /// 成功完成的任务必须被清理，不能永远留在列表里。
