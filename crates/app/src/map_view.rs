@@ -764,7 +764,12 @@ pub fn draw(
         }
     }
 
-    // ---- 坐标提示 ----
+    // ---- 坐标提示（右下角）----
+    //
+    // 注意：这个框贴着画布右下角，所以画布的实际高度必须是对的 ——
+    // 如果状态栏在 CentralPanel 之后声明，画布会按"没有状态栏"算高度，
+    // 这个框的下半截就会被状态栏盖住（文字全看不见，只剩一条黑边）。
+    // 布局顺序见 main.rs 里 update() 的调用处。
     if let Some(hover) = response.hover_pos() {
         let w = cam.screen_to_world(hover, rect);
         let text = format!(
@@ -779,10 +784,23 @@ pub fn draw(
             egui::FontId::proportional(12.0),
             Color32::from_rgb(0xE8, 0xE4, 0xD8),
         );
-        let pos = rect.right_bottom() - galley.size() - Vec2::new(12.0, 8.0);
-        let bg = Rect::from_min_size(pos, galley.size() + Vec2::new(12.0, 6.0));
-        painter.rect_filled(bg, 4.0, Color32::from_black_alpha(170));
-        painter.galley(pos + Vec2::new(6.0, 3.0), galley, Color32::WHITE);
+
+        // 上下左右留同样的内边距，并离画布边缘 10px ——
+        // 原来右/下只留 0~2px，看起来像被切掉一角。
+        let pad = Vec2::new(9.0, 4.0);
+        let sz = galley.size() + pad * 2.0;
+        let bg = Rect::from_min_size(
+            egui::pos2(rect.right() - sz.x - 10.0, rect.bottom() - sz.y - 10.0),
+            sz,
+        );
+        painter.rect_filled(bg, 5.0, Color32::from_black_alpha(185));
+        painter.rect_stroke(
+            bg,
+            5.0,
+            egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(0xC8, 0xA8, 0x60, 90)),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(bg.min + pad, galley, Color32::WHITE);
     }
 
     out.drawn = drawn;

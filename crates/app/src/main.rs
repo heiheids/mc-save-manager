@@ -1291,11 +1291,18 @@ impl eframe::App for App {
         // 左侧属性栏
         panels::sidebar(self, ctx);
 
+        // ★ 底部状态栏必须在 `map_area` **之前**声明。
+        //
+        //   `map_area` 用的是 `CentralPanel`，它会吃掉"当前剩余的全部空间"。
+        //   egui 要求所有 `TopBottomPanel` / `SidePanel` 都先于 `CentralPanel`
+        //   添加；状态栏如果放在后面，中央面板已经按"没有状态栏"算过高度，
+        //   于是状态栏直接压在画布底部 ——
+        //   表现为地图右下角有一条被截断的黑色悬停提示框
+        //   （框本身 22px 高，只有顶部 7px 露在状态栏上方，文字全被盖住）。
+        panels::status_bar(self, ctx);
+
         // 中央地图
         panels::map_area(self, ctx);
-
-        // 底部状态栏
-        panels::status_bar(self, ctx);
 
         // 弹窗
         panels::windows(self, ctx);
