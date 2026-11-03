@@ -128,6 +128,8 @@ jobs:
           node ".ci/patch_rsrc_rva.js" $exe --write
           Write-Host "--- verify: no pending RVA fixes below means OK ---"
           node ".ci/patch_rsrc_rva.js" $exe
+          Write-Host "--- icon check ---"
+          node ".ci/check_icon.js" $exe
 
       - name: Rename artifact
         shell: bash
