@@ -3,7 +3,7 @@
 //! 为什么不内置「全图」视图：实测 26.3 存档主世界有 82419 个区块，
 //! 全图缩放下每区块不足 1 像素，程序内既看不清也拖不动（每次拖动都要
 //! 重新排队上万个区块）。改成导出一个静态 HTML：
-//!   - 浏览器里可以用滚轮缩放、右键拖动，性能远好于即时渲染
+//!   - 浏览器里可以按住左键拖动、Ctrl+滚轮缩放，性能远好于即时渲染
 //!   - 可以把鼠标处的坐标、群系直接标出来
 //!   - 一次导出存档，之后不依赖本程序
 //!
@@ -417,9 +417,12 @@ pub fn build_html(images: &[DimImage], world_name: &str) -> String {
   .canvas img {{
     display: block; image-rendering: pixelated;
     background: #101216; border: 1px solid var(--line);
-    cursor: crosshair;
+    /* 手形表示可以抓住拖走；按住时换成握紧的手 */
+    cursor: grab;
     -webkit-user-drag: none;
+    user-select: none;
   }}
+  .canvas img:active {{ cursor: grabbing; }}
 
   /* 区块网格：纯 CSS 重复渐变，间距由 --g 控制（每区块一条线） */
   .grid {{
@@ -443,7 +446,7 @@ pub fn build_html(images: &[DimImage], world_name: &str) -> String {
 <body>
 <header>
   <h1>{title}</h1>
-  <span class="hint">右键拖动画布 · Ctrl+滚轮缩放</span>
+  <span class="hint">按住左键拖动画布 · Ctrl+滚轮缩放</span>
   <label class="hint" style="cursor:pointer">
     <input type="checkbox" id="gridToggle" onchange="toggleGrid(this.checked)"> 区块网格
   </label>
@@ -495,18 +498,23 @@ function clearHud() {{
   document.getElementById('cursor').style.display = 'none';
 }}
 
-// ---- 右键拖动画布 ----
-// 左键留给"看坐标"，右键才是平移（与程序内手感一致）。
-// 拖动期间屏蔽悬停提示，避免它跟着乱跳。
-var dragState = {{ active: false, x: 0, y: 0, sl: 0, st: 0, stage: null }};
+// ---- 按住左键拖动画布 ----
+//
+// 早先用的是右键拖动，但右键在浏览器里被占用得太多：原生右键菜单、
+// 鼠标手势插件、触摸板双指操作都会抢事件，用户按下去常常先弹出菜单
+// 而不是拖动画布。改成左键之后行为稳定，鼠标移上去是手形、按住变成
+// 握紧的手，也更符合直觉。
+//
+// 拖动期间屏蔽悬停提示，避免坐标框跟着乱跳。
+var dragState = {{ active: false, x: 0, y: 0, sl: 0, st: 0, stage: null, moved: false }};
 
 document.querySelectorAll('.stage').forEach(function (stage) {{
-  stage.addEventListener('contextmenu', function (e) {{ e.preventDefault(); }});
-
   stage.addEventListener('mousedown', function (e) {{
-    if (e.button !== 2) return;
+    if (e.button !== 0) return; // 只响应左键
+    // 阻止浏览器把这次按下当成"拖拽图片"或"选中文字"
     e.preventDefault();
     dragState.active = true;
+    dragState.moved = false;
     dragState.x = e.clientX;
     dragState.y = e.clientY;
     dragState.sl = stage.scrollLeft;
@@ -519,12 +527,25 @@ document.querySelectorAll('.stage').forEach(function (stage) {{
 
 window.addEventListener('mousemove', function (e) {{
   if (!dragState.active || !dragState.stage) return;
-  dragState.stage.scrollLeft = dragState.sl - (e.clientX - dragState.x);
-  dragState.stage.scrollTop = dragState.st - (e.clientY - dragState.y);
+  var dx = e.clientX - dragState.x;
+  var dy = e.clientY - dragState.y;
+  // 移动超过 3px 才算拖动，避免"只是点了一下"就把画布挪走
+  if (!dragState.moved && Math.abs(dx) + Math.abs(dy) < 3) return;
+  dragState.moved = true;
+  dragState.stage.scrollLeft = dragState.sl - dx;
+  dragState.stage.scrollTop = dragState.st - dy;
 }});
 
 window.addEventListener('mouseup', function (e) {{
-  if (e.button !== 2) return;
+  if (e.button !== 0) return;
+  if (!dragState.active) return;
+  dragState.active = false;
+  if (dragState.stage) dragState.stage.classList.remove('dragging');
+  dragState.stage = null;
+}});
+
+// 鼠标在窗口外松开时也要复位，否则会一直粘着
+window.addEventListener('blur', function () {{
   dragState.active = false;
   if (dragState.stage) dragState.stage.classList.remove('dragging');
   dragState.stage = null;
