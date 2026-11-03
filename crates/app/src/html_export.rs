@@ -3,26 +3,30 @@
 //! 为什么不内置「全图」视图：实测 26.3 存档主世界有 82419 个区块，
 //! 全图缩放下每区块不足 1 像素，程序内既看不清也拖不动（每次拖动都要
 //! 重新排队上万个区块）。改成导出一个静态 HTML：
-//!   - 浏览器里可以用鼠标滚轮/拖动自由缩放，性能远好于即时渲染
+//!   - 浏览器里可以用滚轮缩放、右键拖动，性能远好于即时渲染
 //!   - 可以把鼠标处的坐标、群系直接标出来
 //!   - 一次导出存档，之后不依赖本程序
 //!
-//! 产物是**单个自包含 HTML**：贴图以 base64 内嵌，不产生外部依赖，
-//! 方便发给别人或者存档留档。
+//! 产物是**单个自包含 HTML**：贴图以 base64 内嵌，不产生外部依赖。
+//!
+//! # 性能
+//!
+//! 导出优先复用缩略图缓存（见 `crate::cache`）。缓存命中时直接拿每区块
+//! 16×16 的像素贴图，跳过"解压 + 解析 NBT + 扫 24 个 section"这一整套。
+//! 只有 region 文件变过、或缓存里没有的区块才回退到读盘。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use mcworld_core::chunk::{self, SliceMode};
+use mcworld_core::chunk::SliceMode;
 use mcworld_core::colors;
-use mcworld_core::world::{Dimension, RegionCache, World};
+use mcworld_core::world::{Dimension, RegionCache, RegionKind, World};
 
 /// 每个区块在导出的贴图里占的像素数。
 ///
 /// 16 的好处是 1 像素 = 1 方块，浏览器里放大也不会糊；
-/// 缺点是 8 万区块 = 8 万 × 256 像素 = 2000 万像素，PNG 约 10-20 MB。
-///
-/// 因此按总量自适应：区块多时降到 8（1 像素 = 2 方块）甚至 4。
+/// 缺点是 8 万区块 = 8 万 × 256 像素，RGBA 内存 80 MB 左右。
+/// 因此按总量自适应。
 fn tile_px_for(total_chunks: usize) -> usize {
     if total_chunks <= 20_000 {
         16
@@ -33,23 +37,27 @@ fn tile_px_for(total_chunks: usize) -> usize {
     }
 }
 
+/// 缓存里可复用的数据：区块 → (16×16 RGBA, 群系)。
+pub type CachedChunks = HashMap<(i32, i32), (Vec<u8>, Option<String>)>;
+
 /// 单个维度的导出结果。
 pub struct DimImage {
     pub dim_id: String,
     pub dim_display: String,
     /// 覆盖的区块范围（闭区间）。
     pub bounds: (i32, i32, i32, i32),
-    /// 贴图边长（像素）。
     pub width: u32,
     pub height: u32,
     /// 每区块像素数。
     pub tile_px: usize,
     /// RGBA 像素。
     pub rgba: Vec<u8>,
-    /// 采样到的区块数。
     pub chunk_count: usize,
-    /// 区块坐标 → 群系（只记录有数据的）。
+    /// 区块坐标 → 群系。
     pub biomes: BTreeMap<(i32, i32), String>,
+    /// 本维度复用 / 采样数量。
+    pub reused: usize,
+    pub sampled: usize,
 }
 
 /// 把某个维度渲染成一张大图 + 群系表。
@@ -57,6 +65,7 @@ pub fn render_dimension(
     world: &World,
     dim: &Dimension,
     mode: SliceMode,
+    cached: &CachedChunks,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<DimImage, String> {
     let metas = world
@@ -66,7 +75,6 @@ pub fn render_dimension(
         return Err(format!("{} 没有区块", dim.display));
     }
 
-    // 范围
     let (mut min_x, mut max_x, mut min_z, mut max_z) = (i32::MAX, i32::MIN, i32::MAX, i32::MIN);
     for m in &metas {
         min_x = min_x.min(m.x);
@@ -81,18 +89,15 @@ pub fn render_dimension(
     let width = cols * tile as u32;
     let height = rows * tile as u32;
 
-    // 上限保护：RGBA 超过 ~320 MB 就拒绝（10000×8000 像素左右）
     let pixels = width as u64 * height as u64;
     if pixels > 80_000_000 {
         return Err(format!(
-            "{} 太大（{width}×{height} 像素），请先在程序里用「保存缓存」减少重算，\
-             或分区域导出",
+            "{} 太大（{width}×{height} 像素），请分区域导出",
             dim.display
         ));
     }
 
     let mut rgba = vec![0u8; pixels as usize * 4];
-    // 底色：深灰蓝，与程序内一致，避免透明区域看起来像"漏了"
     for px in rgba.chunks_exact_mut(4) {
         px[0] = 0x1A;
         px[1] = 0x1C;
@@ -103,26 +108,57 @@ pub fn render_dimension(
     let mut biomes: BTreeMap<(i32, i32), String> = BTreeMap::new();
     let mut cache = RegionCache::new(64);
     let total = metas.len();
-    let mut done = 0usize;
+    let mut reused = 0usize;
+    let mut sampled = 0usize;
 
-    for m in &metas {
-        done += 1;
-        if done % 64 == 0 {
-            progress(done, total);
+    // 每像素代表区块内的第几列（tile=16 → 1，tile=8 → 2，tile=4 → 4）
+    let step = 16 / tile;
+
+    for (i, m) in metas.iter().enumerate() {
+        if i % 32 == 0 {
+            progress(i, total);
         }
-
-        let Some(surf) = world.chunk_surface(dim, m.x, m.z, &mut cache, mode) else {
-            continue;
-        };
 
         let bx = ((m.x - min_x) as u32) * tile as u32;
         let bz = ((m.z - min_z) as u32) * tile as u32;
-        // 每格多少方块：16 / tile。tile=16 → 1；tile=8 → 2；tile=4 → 4
-        let step = 16 / tile;
+
+        // ---- 优先走缓存 ----
+        let mut done = false;
+        if let Some((px, biome)) = cached.get(&(m.x, m.z)) {
+            if px.len() == 16 * 16 * 4 {
+                for ty in 0..tile {
+                    for tx in 0..tile {
+                        // 缓存是 16×16，按 step 取样降采样到 tile×tile
+                        let sx = tx * step;
+                        let sy = ty * step;
+                        let si = (sy * 16 + sx) * 4;
+                        let di = ((bz + ty as u32) * width + (bx + tx as u32)) as usize * 4;
+                        rgba[di] = px[si];
+                        rgba[di + 1] = px[si + 1];
+                        rgba[di + 2] = px[si + 2];
+                        rgba[di + 3] = 0xFF;
+                    }
+                }
+                if let Some(b) = biome {
+                    biomes.insert((m.x, m.z), b.clone());
+                }
+                reused += 1;
+                done = true;
+            }
+        }
+
+        if done {
+            continue;
+        }
+
+        // ---- 缓存未命中：读盘 ----
+        let Some(surf) = world.chunk_surface(dim, m.x, m.z, &mut cache, mode) else {
+            continue;
+        };
+        sampled += 1;
 
         for ty in 0..tile {
             for tx in 0..tile {
-                // 该像素代表区块内的第几列
                 let lx = tx * step;
                 let lz = ty * step;
                 let idx = lz * 16 + lx;
@@ -134,16 +170,15 @@ pub fn render_dimension(
                 } else {
                     colors::block_color(&col.block)
                 };
-
-                let px = ((bz + ty as u32) * width + (bx + tx as u32)) as usize * 4;
-                rgba[px] = c[0];
-                rgba[px + 1] = c[1];
-                rgba[px + 2] = c[2];
-                rgba[px + 3] = 0xFF;
+                let di = ((bz + ty as u32) * width + (bx + tx as u32)) as usize * 4;
+                rgba[di] = c[0];
+                rgba[di + 1] = c[1];
+                rgba[di + 2] = c[2];
+                rgba[di + 3] = 0xFF;
             }
         }
 
-        // 群系：取区块中心高度的群系
+        // 群系：取区块中心列的高度作为采样层
         let cx_world = m.x * 16 + 8;
         let cz_world = m.z * 16 + 8;
         let y = surf
@@ -168,6 +203,8 @@ pub fn render_dimension(
         rgba,
         chunk_count: metas.len(),
         biomes,
+        reused,
+        sampled,
     })
 }
 
@@ -175,10 +212,6 @@ pub fn render_dimension(
 // PNG 编码
 // ---------------------------------------------------------------------------
 
-/// 极简 PNG 编码（RGBA，无滤波）。
-///
-/// 不引入 image crate：它体积大，而我们只需要"把 RGBA 压成 PNG"这一件事。
-/// deflate 用 flate2（已经是依赖）。
 fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
@@ -187,18 +220,16 @@ fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
 
-    // IHDR
     let mut ihdr = Vec::with_capacity(13);
     ihdr.extend_from_slice(&width.to_be_bytes());
     ihdr.extend_from_slice(&height.to_be_bytes());
-    ihdr.push(8); // bit depth
-    ihdr.push(6); // color type: RGBA
-    ihdr.push(0); // compression
-    ihdr.push(0); // filter
-    ihdr.push(0); // interlace
+    ihdr.push(8);
+    ihdr.push(6);
+    ihdr.push(0);
+    ihdr.push(0);
+    ihdr.push(0);
     write_chunk(&mut out, b"IHDR", &ihdr);
 
-    // IDAT：每行前加一个 filter byte(0)
     let row_bytes = width as usize * 4;
     let mut raw = Vec::with_capacity((row_bytes + 1) * height as usize);
     for y in 0..height as usize {
@@ -224,7 +255,6 @@ fn write_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&crc.finish().to_be_bytes());
 }
 
-/// CRC-32（PNG 用的那种）。
 struct Crc32 {
     table: [u32; 256],
     value: u32,
@@ -273,7 +303,6 @@ pub fn build_html(images: &[DimImage], world_name: &str) -> String {
             html_escape(&img.dim_display)
         ));
 
-        // 群系表：JSON，键是 "cx,cz"
         let mut biome_json = String::from("{");
         for (k, (c, v)) in img.biomes.iter().enumerate() {
             if k > 0 {
@@ -283,7 +312,7 @@ pub fn build_html(images: &[DimImage], world_name: &str) -> String {
                 "\"{},{}\":\"{}\"",
                 c.0,
                 c.1,
-                html_escape(v)
+                html_escape(v.strip_prefix("minecraft:").unwrap_or(v))
             ));
         }
         biome_json.push('}');
@@ -297,12 +326,16 @@ pub fn build_html(images: &[DimImage], world_name: &str) -> String {
     <span class="dim">{dim}</span>
     <span>区块 {x0}, {z0} → {x1}, {z1}</span>
     <span>共 {n} 个区块</span>
-    <span>每区块 {tile} 像素</span>
+    <span>每区块 {tile} px</span>
+    <span class="muted">缓存复用 {reused} / 读盘 {sampled}</span>
   </div>
   <div class="stage">
-    <img id="img{i}" src="data:image/png;base64,{b64}" width="{w}" height="{h}"
-         data-bx="{x0}" data-bz="{z0}" data-tile="{tile}"
-         onmousemove="hover(event,{i})" onmouseleave="clearHud({i})">
+    <div class="canvas" style="width:{w}px;height:{h}px">
+      <img id="img{i}" src="data:image/png;base64,{b64}" width="{w}" height="{h}"
+           data-bx="{x0}" data-bz="{z0}" data-tile="{tile}"
+           onmousemove="hover(event,{i})" onmouseleave="clearHud()" draggable="false">
+      <div class="grid" id="grid{i}" style="--g:{tile}px"></div>
+    </div>
   </div>
 </div>
 <script>BIOMES[{i}] = {biome_json};</script>
@@ -315,6 +348,8 @@ pub fn build_html(images: &[DimImage], world_name: &str) -> String {
             z1 = z1,
             n = img.chunk_count,
             tile = img.tile_px,
+            reused = img.reused,
+            sampled = img.sampled,
             b64 = b64,
             w = img.width,
             h = img.height,
@@ -336,60 +371,81 @@ pub fn build_html(images: &[DimImage], world_name: &str) -> String {
     --text: #e8e4d8; --dim: #9aa0a8; --accent: #9bb06a;
   }}
   * {{ box-sizing: border-box; }}
+  html, body {{ height: 100%; }}
   body {{
     margin: 0; background: var(--bg); color: var(--text);
     font: 14px/1.5 system-ui, "Microsoft YaHei", sans-serif;
+    display: flex; flex-direction: column;
   }}
   header {{
-    position: sticky; top: 0; z-index: 10;
-    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
-    padding: 10px 16px; background: var(--panel);
+    flex: 0 0 auto;
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 9px 16px; background: var(--panel);
     border-bottom: 1px solid var(--line);
   }}
-  h1 {{ font-size: 16px; margin: 0; font-weight: 600; }}
+  h1 {{ font-size: 15px; margin: 0; font-weight: 600; }}
+  .hint {{ color: var(--dim); font-size: 12px; }}
   .tabs {{ display: flex; gap: 6px; margin-left: auto; }}
   .tab {{
     background: #2a2e35; color: var(--text); border: 1px solid var(--line);
     padding: 5px 14px; border-radius: 6px; cursor: pointer; font-size: 13px;
   }}
   .tab.active {{ background: var(--accent); color: #14170f; border-color: var(--accent); }}
-  .pane {{ display: none; }}
-  .pane.active {{ display: block; }}
+  .pane {{ display: none; flex: 1 1 auto; min-height: 0; flex-direction: column; }}
+  .pane.active {{ display: flex; }}
   .hud {{
-    padding: 8px 16px; color: var(--dim); font-size: 13px;
-    display: flex; gap: 18px; flex-wrap: wrap;
+    flex: 0 0 auto;
+    padding: 6px 16px; color: var(--dim); font-size: 12.5px;
+    display: flex; gap: 16px; flex-wrap: wrap;
   }}
   .hud .dim {{ color: var(--accent); font-weight: 600; }}
-  .stage {{ overflow: auto; padding: 0 16px 24px; }}
-  .stage img {{
+  .hud .muted {{ opacity: .75; }}
+
+  .stage {{
+    flex: 1 1 auto; min-height: 0;
+    overflow: auto; padding: 0 16px 16px;
+    cursor: grab;
+    user-select: none;
+  }}
+  .stage.dragging {{ cursor: grabbing; }}
+  .canvas {{ position: relative; }}
+  .canvas img {{
     display: block; image-rendering: pixelated;
     background: #101216; border: 1px solid var(--line);
     cursor: crosshair;
+    -webkit-user-drag: none;
   }}
+
+  /* 区块网格：纯 CSS 重复渐变，间距由 --g 控制（每区块一条线） */
+  .grid {{
+    position: absolute; inset: 1px; pointer-events: none;
+    display: none;
+    background-image:
+      repeating-linear-gradient(to right, rgba(255,255,255,.20) 0 1px, transparent 1px var(--g)),
+      repeating-linear-gradient(to bottom, rgba(255,255,255,.20) 0 1px, transparent 1px var(--g));
+  }}
+  .grid.on {{ display: block; }}
+
   #cursor {{
     position: fixed; pointer-events: none; z-index: 100;
-    background: rgba(20,22,26,.94); border: 1px solid var(--accent);
+    background: rgba(20,22,26,.95); border: 1px solid var(--accent);
     border-radius: 6px; padding: 6px 10px; font-size: 13px;
     white-space: nowrap; display: none;
   }}
   #cursor b {{ color: var(--accent); }}
-  footer {{
-    padding: 10px 16px 28px; color: var(--dim); font-size: 12px;
-  }}
 </style>
 </head>
 <body>
 <header>
   <h1>{title}</h1>
-  <span style="color:var(--dim);font-size:13px">滚轮缩放由浏览器负责（Ctrl+滚轮）</span>
+  <span class="hint">右键拖动画布 · Ctrl+滚轮缩放</span>
+  <label class="hint" style="cursor:pointer">
+    <input type="checkbox" id="gridToggle" onchange="toggleGrid(this.checked)"> 区块网格
+  </label>
   <div class="tabs">{tabs}</div>
 </header>
 <div id="cursor"></div>
 {bodies}
-<footer>
-  坐标说明：把鼠标放到地图上即可看到该处的方块坐标与群系。<br>
-  区块坐标 × 16 = 方块坐标；本文件为静态快照，不包含实体与方块实体信息。
-</footer>
 <script>
 var BIOMES = [];
 function show(i) {{
@@ -400,10 +456,15 @@ function show(i) {{
     t.classList.toggle('active', k === i);
   }});
 }}
+function toggleGrid(on) {{
+  document.querySelectorAll('.grid').forEach(function (g) {{
+    g.classList.toggle('on', on);
+  }});
+}}
 function hover(e, i) {{
-  var img = e.target;
+  if (dragState.active) return;
+  var img = e.currentTarget;
   var rect = img.getBoundingClientRect();
-  // 屏幕像素 → 图片像素（考虑浏览器缩放）
   var px = (e.clientX - rect.left) * (img.naturalWidth / rect.width);
   var py = (e.clientY - rect.top) * (img.naturalHeight / rect.height);
 
@@ -413,22 +474,56 @@ function hover(e, i) {{
 
   var cx = bx + Math.floor(px / tile);
   var cz = bz + Math.floor(py / tile);
-  // 图片像素 → 方块：每图片像素 = 16/tile 方块
   var step = 16 / tile;
   var wx = cx * 16 + Math.floor((px % tile) * step);
   var wz = cz * 16 + Math.floor((py % tile) * step);
 
   var box = document.getElementById('cursor');
-  var biome = (BIOMES[i] && BIOMES[i][cx + ',' + cz]) || '未知';
+  var b = BIOMES[i] && BIOMES[i][cx + ',' + cz];
   box.innerHTML = '<b>X ' + wx + ' Z ' + wz + '</b><br>区块 ' + cx + ', ' + cz +
-                  '<br>群系 ' + biome;
+                  '<br>群系 ' + (b || '未知');
   box.style.display = 'block';
-  box.style.left = (e.clientX + 16) + 'px';
+  box.style.left = Math.min(e.clientX + 16, window.innerWidth - 190) + 'px';
   box.style.top = (e.clientY + 16) + 'px';
 }}
-function clearHud(i) {{
+function clearHud() {{
   document.getElementById('cursor').style.display = 'none';
 }}
+
+// ---- 右键拖动画布 ----
+// 左键留给"看坐标"，右键才是平移（与程序内手感一致）。
+// 拖动期间屏蔽悬停提示，避免它跟着乱跳。
+var dragState = {{ active: false, x: 0, y: 0, sl: 0, st: 0, stage: null }};
+
+document.querySelectorAll('.stage').forEach(function (stage) {{
+  stage.addEventListener('contextmenu', function (e) {{ e.preventDefault(); }});
+
+  stage.addEventListener('mousedown', function (e) {{
+    if (e.button !== 2) return;
+    e.preventDefault();
+    dragState.active = true;
+    dragState.x = e.clientX;
+    dragState.y = e.clientY;
+    dragState.sl = stage.scrollLeft;
+    dragState.st = stage.scrollTop;
+    dragState.stage = stage;
+    stage.classList.add('dragging');
+    clearHud();
+  }});
+}});
+
+window.addEventListener('mousemove', function (e) {{
+  if (!dragState.active || !dragState.stage) return;
+  dragState.stage.scrollLeft = dragState.sl - (e.clientX - dragState.x);
+  dragState.stage.scrollTop = dragState.st - (e.clientY - dragState.y);
+}});
+
+window.addEventListener('mouseup', function (e) {{
+  if (e.button !== 2) return;
+  dragState.active = false;
+  if (dragState.stage) dragState.stage.classList.remove('dragging');
+  dragState.stage = null;
+}});
 </script>
 </body>
 </html>
@@ -470,7 +565,56 @@ fn base64(data: &[u8]) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// 入口
+// ---------------------------------------------------------------------------
+
+/// 从磁盘加载某个维度的缩略图缓存，并剔除"region 已变化"的区块。
+///
+/// 返回可复用的区块表；缓存不存在 / 格式不符 / 变化太大时返回空表
+/// （调用方会全部走读盘，行为与没有缓存时一致）。
+pub fn load_usable_cache(
+    save_root: &Path,
+    dim: &Dimension,
+    slice: &str,
+    data_version: i32,
+) -> CachedChunks {
+    let dir = crate::cache::save_cache_dir(save_root).join(sanitize(&dim.id));
+
+    let Some((meta, tiles, biomes)) = crate::cache::load(&dir) else {
+        return CachedChunks::new();
+    };
+    if meta.slice != slice || meta.data_version != data_version {
+        return CachedChunks::new();
+    }
+
+    let region_dir = dim.dir(RegionKind::Terrain);
+    let now = crate::cache::collect_stamps(&region_dir);
+    let changed = meta.changed_regions(&now);
+
+    let mut out = CachedChunks::new();
+    for (i, (cx, cz)) in meta.chunks.iter().enumerate() {
+        let rx = cx.div_euclid(32);
+        let rz = cz.div_euclid(32);
+        if changed.iter().any(|(a, b)| *a == rx && *b == rz) {
+            continue; // 这个 region 变过，重新采样
+        }
+        let Some(px) = tiles.get(i) else { continue };
+        let b = biomes.get(i).cloned().flatten();
+        out.insert((*cx, *cz), (px.clone(), b));
+    }
+    out
+}
+
+fn sanitize(id: &str) -> String {
+    id.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
+}
+
 /// 一次性导出：`dims` 为空表示导出全部维度。
+///
+/// `progress` 的第一个参数是给用户看的阶段描述。
 pub fn export_html(
     world_root: &Path,
     dims: &[String],
@@ -480,12 +624,17 @@ pub fn export_html(
 ) -> Result<String, String> {
     let world = World::open(world_root).map_err(|e| e.to_string())?;
     let world_name = world.level.level_name();
+    let data_version = world.level.data_version();
+    let slice = match mode {
+        SliceMode::Surface => "surface".to_string(),
+        SliceMode::Fixed(y) => format!("fixed:{y}"),
+    };
 
     let selected: Vec<Dimension> = world
         .dimensions
         .iter()
         .filter(|d| dims.is_empty() || dims.iter().any(|s| s == &d.id))
-        .filter(|d| d.exists(mcworld_core::world::RegionKind::Terrain))
+        .filter(|d| d.exists(RegionKind::Terrain))
         .cloned()
         .collect();
 
@@ -494,22 +643,40 @@ pub fn export_html(
     }
 
     let mut images = Vec::new();
+    let mut total_reused = 0usize;
+    let mut total_sampled = 0usize;
+
     for dim in &selected {
+        progress(&format!("读取缓存 · {}", dim.display), 0, 1);
+        let cached = load_usable_cache(world_root, dim, &slice, data_version);
+
         let mut cb = |done: usize, total: usize| {
             progress(&dim.display, done, total);
         };
-        let img = render_dimension(&world, dim, mode, &mut cb)?;
+        let img = render_dimension(&world, dim, mode, &cached, &mut cb)?;
+        total_reused += img.reused;
+        total_sampled += img.sampled;
         images.push(img);
     }
 
+    progress("生成网页", 0, 1);
     let html = build_html(&images, &world_name);
     std::fs::write(out_path, html.as_bytes()).map_err(|e| e.to_string())?;
 
     let total_chunks: usize = images.iter().map(|i| i.chunk_count).sum();
-    Ok(format!(
-        "已导出 {} 个维度、{} 个区块 → {}",
+    let mut msg = format!(
+        "已导出 {} 个维度、{} 个区块 → {}\n缓存复用 {} 个，读盘 {} 个",
         images.len(),
         total_chunks,
-        out_path.display()
-    ))
+        out_path.display(),
+        total_reused,
+        total_sampled
+    );
+    if total_reused == 0 && total_chunks > 2000 {
+        msg.push_str(
+            "\n提示：这个维度还没有缩略图缓存，全部重新读盘了。\n\
+             在程序里点「保存缓存」后再导出会快得多。",
+        );
+    }
+    Ok(msg)
 }

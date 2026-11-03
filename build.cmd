@@ -34,6 +34,12 @@ REM Use --config to layer them on top of the repo .cargo/config.toml.
 set LOCALCFG=
 if exist "%ROOT%.cargo\config.local.toml" set LOCALCFG=--config "%ROOT%.cargo\config.local.toml"
 
+REM Regenerate the resource object (icon + version info + manifest) from
+REM the ICO and the version in Cargo.toml, so VERSIONINFO never goes stale.
+if exist "%ROOT%.ci\make_rsrc_obj.js" (
+    node "%ROOT%.ci\make_rsrc_obj.js" "%ROOT%crates\app\assets\icon.ico" "%ROOT%crates\app\assets\icon_obj.obj"
+)
+
 if "%~1"=="" (
     cargo build %LOCALCFG% --target x86_64-pc-windows-gnullvm
 ) else (
@@ -44,8 +50,9 @@ if %RC%==0 (
     REM Icon resource patch: COFF DataEntry.OffsetToData can only hold a
     REM section-relative offset. After linking we must add the .rsrc VA to
     REM make it a valid global RVA, otherwise Windows cannot read the icon.
-    if exist "%ROOT%.build\patch_rsrc_rva.js" (
-        node "%ROOT%.build\patch_rsrc_rva.js" "%ROOT%target\x86_64-pc-windows-gnullvm\debug\mcworld-app.exe" --write
+    if exist "%ROOT%.ci\patch_rsrc_rva.js" (
+        node "%ROOT%.ci\patch_rsrc_rva.js" "%ROOT%target\x86_64-pc-windows-gnullvm\debug\mcworld-app.exe" --write
+        node "%ROOT%.ci\check_resources.js" "%ROOT%target\x86_64-pc-windows-gnullvm\debug\mcworld-app.exe"
     )
 )
 popd

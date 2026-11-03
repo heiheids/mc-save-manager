@@ -28,6 +28,11 @@ pub struct ChunkTile {
     ///   1. 保存缩略图缓存时直接落盘，不必重新读存档
     ///   2. 悬停查询可以省掉一次磁盘读取
     pub pixels: Vec<u8>,
+    /// 该区块中心处的群系 id（如 `minecraft:plains`）。
+    ///
+    /// 缓存要连群系一起存，否则导出 HTML 时还得逐个读盘查群系，
+    /// 那就把缓存省下来的时间又还回去了。
+    pub biome: Option<String>,
     /// 采样列数据，供鼠标悬停查询方块与高度。
     ///
     /// **默认不保留**：这是"缩略图化"的关键。
@@ -66,7 +71,7 @@ impl TileCache {
     }
 
     /// 用采样数据生成纹理。
-    pub fn insert(&mut self, ctx: &egui::Context, surface: &ChunkSurface) {
+    pub fn insert(&mut self, ctx: &egui::Context, surface: &ChunkSurface, biome: Option<String>) {
         let mut img = ColorImage::filled([16, 16], Color32::TRANSPARENT);
         for (i, col) in surface.columns.iter().enumerate().take(256) {
             let x = i % 16;
@@ -123,6 +128,7 @@ impl TileCache {
                 texture: tex,
                 avg_color,
                 pixels,
+                biome,
                 columns: Vec::new(),
             },
         );
@@ -197,6 +203,7 @@ impl TileCache {
                 texture: tex,
                 avg_color,
                 pixels,
+                biome: None,
                 columns: Vec::new(),
             },
         );
@@ -212,10 +219,10 @@ impl TileCache {
     /// 早期实现里 `ChunkTile` 只保留 texture 不保留像素，
     /// 所以这里改成把像素一起存着 —— 16×16 RGBA 只有 1 KB，
     /// 8 万区块也就 80 MB，比重新读盘几十分钟划算得多。
-    pub fn snapshot_for_cache(&self) -> Vec<((i32, i32), Vec<u8>)> {
+    pub fn snapshot_for_cache(&self) -> Vec<((i32, i32), Vec<u8>, Option<String>)> {
         self.tiles
             .iter()
-            .map(|(k, t)| (*k, t.pixels.clone()))
+            .map(|(k, t)| (*k, t.pixels.clone(), t.biome.clone()))
             .collect()
     }
 

@@ -101,9 +101,17 @@ jobs:
             libgl1-mesa-dev libxkbcommon-dev libwayland-dev \
             libxinerama-dev
 
-      # Windows 需要把图标资源链进 exe。
+      # 生成资源对象：图标 + 版本信息 + 清单。
       #
-      # `icon_obj.obj` 是手工构造的 COFF 对象（含 `.rsrc` 节），已在仓库里。
+      # 不能靠提交一个固定的 .obj —— 版本号改了它不会跟着变，
+      # Windows 属性页会显示旧版本；而缺 VERSIONINFO / MANIFEST 的 exe，
+      # 在杀软眼里就是"来路不明的自制程序"，很容易被误报。
+      - name: Generate resource object
+        shell: bash
+        run: node .ci/make_rsrc_obj.js crates/app/assets/icon.ico crates/app/assets/icon_obj.obj
+
+      # 把资源对象链进 exe。
+      #
       # 本机构建通过 `.cargo/config.local.toml` 的 link-arg 引入，但那个文件
       # 不进 Git，所以 CI 必须在这里显式加 —— 否则发布出来的 exe 没有图标。
       - name: Build

@@ -10,7 +10,7 @@
 > level without needing the game running. Supports **1.21.1** through
 > **26.4 snapshots**. [Jump to English](#english)
 
-![版本](https://img.shields.io/badge/version-1.0.2-brightgreen)
+![版本](https://img.shields.io/badge/version-1.0.3-brightgreen)
 ![协议](https://img.shields.io/badge/license-GPL--3.0-blue)
 
 **中文** | [English](#english)
@@ -55,6 +55,19 @@
 全图缩放下每区块不足 1 像素，而且每次拖动都要重新排队上万个区块。
 导出成 HTML 后由浏览器负责缩放，流畅得多，而且可以把文件发给别人或留档。
 导出的网页是单个自包含文件（贴图以 base64 内嵌），不依赖本程序。
+
+网页里可以用**右键拖动**平移、`Ctrl+滚轮` 缩放，勾选「区块网格」显示区块边界，
+鼠标移上去会显示该处的方块坐标、区块坐标与群系。
+
+导出会**优先复用缩略图缓存**。实测同一个存档（2601 区块）：
+
+| | 耗时 |
+|---|---|
+| 无缓存 | 15.1 秒 |
+| 有缓存 | **0.71 秒** |
+
+输出图片的 SHA256 完全一致，说明复用缓存不影响画质。
+对于八万区块的大存档，差距会更明显。
 
 ### 大存档与缓存
 
@@ -176,6 +189,24 @@ docs/
 
 ---
 
+## 杀毒软件误报
+
+本程序是**未签名**的独立可执行文件，且下载量小，Windows Defender 等
+基于信誉的引擎有时会误报。程序本身的行为是可以核对的：
+
+- 不联网、不访问注册表、不创建开机自启项
+- 不启动任何子进程
+- 只读写你打开的那个存档目录，以及程序目录下的 `地图缓存/`
+
+如果被拦截，可以：
+
+1. 核对 SHA256（每个 Release 页面都附了）
+2. 在 Defender 里对程序目录添加排除项
+3. 向微软提交误报：<https://www.microsoft.com/wdsi/filesubmission>
+
+从 v1.0.3 起，exe 内嵌了完整的版本信息与应用程序清单（DPI 感知、
+`asInvoker` 执行级别），外观上与常规 Windows 程序一致，有助于减少误判。
+
 ## 已知限制
 
 - **地图采样是全区扫描**，大存档（上万区块）首次加载需要十几秒
@@ -216,7 +247,7 @@ A Minecraft save editor written in Rust. It edits the world directly at the
 save-file level — no need for the game to be running. Supports **1.21.1**
 through **26.4 snapshots**.
 
-![version](https://img.shields.io/badge/version-1.0.2-brightgreen)
+![version](https://img.shields.io/badge/version-1.0.3-brightgreen)
 ![license](https://img.shields.io/badge/license-GPL--3.0-blue)
 
 ---
@@ -266,9 +297,24 @@ browser handle zooming, which is far smoother — and the file can be shared or 
 The output is a single self-contained file (textures embedded as base64) that does
 not require this program.
 
+In the page you can **pan with the right mouse button**, zoom with `Ctrl+wheel`,
+toggle a **chunk grid** overlay, and hover to read the block coordinates, chunk
+coordinates and biome under the cursor.
+
+Export **reuses the thumbnail cache** when available. Measured on one save
+(2601 chunks):
+
+| | Time |
+|---|---|
+| No cache | 15.1 s |
+| With cache | **0.71 s** |
+
+The embedded PNG is byte-identical (same SHA256), so reusing the cache costs
+nothing in output quality. The gap is much larger on an 80k-chunk save.
+
 ### Large saves and caching
 
-When a dimension has more than **2000** chunks, the program offers to save a
+When a dimension has more than **8000** chunks, the program offers to save a
 thumbnail cache on open.
 
 - The cache stores each chunk's 16×16 thumbnail plus each region file's
@@ -393,6 +439,26 @@ docs/
 ```
 
 ---
+
+## Antivirus false positives
+
+This is an **unsigned** standalone executable with a low download count, so
+reputation-based engines such as Windows Defender occasionally flag it. The
+program's behaviour is easy to audit:
+
+- No network access, no registry access, no autostart entries
+- No child processes are spawned
+- It only touches the save you open, plus `地图缓存/` next to the executable
+
+If it gets blocked you can:
+
+1. Verify the SHA256 (published with every release)
+2. Add an exclusion for the program folder in Defender
+3. Report the false positive: <https://www.microsoft.com/wdsi/filesubmission>
+
+Since v1.0.3 the executable embeds full version information and an application
+manifest (DPI awareness, `asInvoker` execution level), which makes it look like
+an ordinary Windows application and helps reduce false positives.
 
 ## Known limitations
 

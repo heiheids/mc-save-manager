@@ -1590,10 +1590,22 @@ pub fn status_bar(app: &mut App, ctx: &egui::Context) {
                             } else {
                                 0.0
                             };
+                            // 进度条上要能看出"做到哪了"：
+                            //   - 有阶段性 message（如 "主世界 1234/5678"）就优先显示它
+                            //   - 再补上百分比
+                            //   以前只显示任务名，"导出全图 HTML" 挂了十几分钟
+                            //   却看不出到底在动还是卡死了。
+                            let text = if p.message.is_empty() {
+                                format!("{label}")
+                            } else if p.total > 0 {
+                                format!("{}  {:.0}%", p.message, frac * 100.0)
+                            } else {
+                                p.message.clone()
+                            };
                             ui.add(
                                 egui::ProgressBar::new(frac)
-                                    .desired_width(160.0)
-                                    .text(format!("{label}")),
+                                    .desired_width(220.0)
+                                    .text(text),
                             );
                         }
                     }
@@ -1776,6 +1788,9 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
     if app.show_export_html {
         export_html_window(app, ctx);
     }
+
+    // 导出进行中：浮窗显示阶段和进度（状态栏那个太小，容易看不见）
+    export_progress_window(app, ctx);
     if app.show_cache_prompt {
         cache_prompt_window(app, ctx);
     }
@@ -2749,4 +2764,64 @@ fn cache_prompt_window(app: &mut App, ctx: &egui::Context) {
         app.show_cache_prompt = false;
         app.request_save_cache();
     }
+}
+
+
+/// 导出/缓存任务进行中的浮窗。
+///
+/// 只在存在"导出全图 HTML"或"保存缓存"任务时显示。
+/// 大存档导出要几十秒到几分钟，没有明确的进度指示用户会以为程序卡死。
+fn export_progress_window(app: &mut App, ctx: &egui::Context) {
+    let busy = app.jobs.labels();
+    let job = busy
+        .iter()
+        .find(|(label, _)| label.contains("导出") || label.contains("缓存"));
+
+    let Some((label, prog)) = job else {
+        return;
+    };
+
+    let frac = if prog.total > 0 {
+        prog.done as f32 / prog.total as f32
+    } else {
+        0.0
+    };
+
+    egui::Window::new("处理中")
+        .collapsible(false)
+        .resizable(false)
+        .title_bar(false)
+        .anchor(egui::Align2::CENTER_TOP, egui::Vec2::new(0.0, 90.0))
+        .show(ctx, |ui| {
+            ui.set_min_width(360.0);
+            ui.label(RichText::new(label.clone()).strong());
+            ui.add_space(6.0);
+
+            ui.add(
+                egui::ProgressBar::new(frac)
+                    .desired_width(340.0)
+                    .text(if prog.total > 0 {
+                        format!(
+                            "{}  ·  {}/{}",
+                            if prog.message.is_empty() { "-" } else { &prog.message },
+                            prog.done,
+                            prog.total
+                        )
+                    } else if prog.message.is_empty() {
+                        "准备中…".to_string()
+                    } else {
+                        prog.message.clone()
+                    }),
+            );
+
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("大存档需要几分钟，请勿关闭程序。")
+                    .size(11.5)
+                    .color(theme::TEXT_DIM),
+            );
+        });
+
+    // 保持刷新，让进度条动起来
+    ctx.request_repaint_after(std::time::Duration::from_millis(120));
 }

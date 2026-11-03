@@ -459,7 +459,7 @@ impl Jobs {
         region_dir: PathBuf,
         slice: String,
         data_version: i32,
-        tiles: Vec<((i32, i32), Vec<u8>)>,
+        tiles: Vec<((i32, i32), Vec<u8>, Option<String>)>,
     ) {
         let (tx, rx) = channel();
         let id = self.next_id;
@@ -470,6 +470,7 @@ impl Jobs {
             let dir = crate::cache::save_cache_dir(&save_root).join(sanitize(&dim_id));
             let stamps = crate::cache::collect_stamps(&region_dir);
             let mut meta = crate::cache::CacheMeta {
+                format_version: crate::cache::FORMAT_VERSION,
                 dim_id,
                 slice,
                 data_version,
@@ -477,11 +478,13 @@ impl Jobs {
                 chunks: Vec::new(),
             };
             let mut data = Vec::with_capacity(tiles.len());
-            for (key, px) in tiles {
+            let mut biomes = Vec::with_capacity(tiles.len());
+            for (key, px, bi) in tiles {
                 meta.chunks.push(key);
                 data.push(px);
+                biomes.push(bi);
             }
-            match crate::cache::save(&dir, &meta, &data) {
+            match crate::cache::save(&dir, &meta, &data, &biomes) {
                 Ok(()) => {
                     let _ = tx.send(JobResult::CacheSaved {
                         message: format!(
@@ -525,7 +528,7 @@ impl Jobs {
 
         std::thread::spawn(move || {
             let dir = crate::cache::save_cache_dir(&save_root).join(sanitize(&dim_id));
-            let Some((meta, tiles)) = crate::cache::load(&dir) else {
+            let Some((meta, tiles, _biomes)) = crate::cache::load(&dir) else {
                 // 没有缓存，静默返回（前端会走正常扫描）
                 return;
             };

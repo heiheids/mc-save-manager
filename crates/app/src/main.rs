@@ -886,10 +886,48 @@ impl App {
                         // 纹理写进该维度自己的缓存；即使当前已切到别的维度也能正常保存。
                         // 写完纹理就不再需要原始区块数据了，chunk_surface 返回的
                         // ChunkSurface 在下一批里自然释放 —— 这就是"缩略图化"。
+                        // 群系要跟着缩略图一起存（导出 HTML、保存缓存都要用）。
+                        //
+                        // ★ 必须在 `ensure_view`（可变借用 tab）之前算完：
+                        //   否则拿不到 `tab.world` 的不可变借用。
+                        let biomes: Vec<Option<String>> = {
+                            let dim_now = tab
+                                .world
+                                .dimensions
+                                .iter()
+                                .find(|d| d.id == dimension)
+                                .cloned();
+                            match dim_now {
+                                Some(d) => {
+                                    let mut bcache =
+                                        mcworld_core::world::RegionCache::new(16);
+                                    surfaces
+                                        .iter()
+                                        .map(|s| {
+                                            let y = s
+                                                .columns
+                                                .get(8 * 16 + 8)
+                                                .map(|c| if c.y < 0 { 64 } else { c.y })
+                                                .unwrap_or(64);
+                                            tab.world.biome_at(
+                                                &d,
+                                                s.x * 16 + 8,
+                                                y,
+                                                s.z * 16 + 8,
+                                                &mut bcache,
+                                            )
+                                        })
+                                        .collect()
+                                }
+                                None => vec![None; surfaces.len()],
+                            }
+                        };
+
                         let v = tab.ensure_view(&dimension);
-                        for s in &surfaces {
+                        for (i, s) in surfaces.iter().enumerate() {
                             let key = (s.x, s.z);
-                            v.map.insert(ctx, s);
+                            let b = biomes.get(i).cloned().flatten();
+                            v.map.insert(ctx, s, b);
                             v.pending.remove(&key);
                         }
                         // 无数据的区块也要从 pending 里移走，
@@ -1066,6 +1104,7 @@ impl App {
         };
 
         // 从纹理缓存里取出每区块的像素
+        // 缩略图 + 群系一起存：导出 HTML 时就不用再读盘查群系了。
         let tiles = tab.view().map.snapshot_for_cache();
         if tiles.is_empty() {
             self.set_status("当前维度还没有已渲染的区块，无法保存缓存", StatusKind::Info);
@@ -1202,7 +1241,7 @@ impl eframe::App for App {
         // 否则每次扫描完成都弹会很烦。
         if !self.cache_prompt_done {
             let n = self.tab().map(|t| t.chunk_count()).unwrap_or(0);
-            if n > 2000 {
+            if n > CACHE_PROMPT_THRESHOLD {
                 self.cache_prompt_done = true;
                 self.cache_prompt_chunks = n;
                 self.show_cache_prompt = true;
@@ -1347,14 +1386,16 @@ fn main() -> eframe::Result<()> {
     // 不指定维度就是全部维度。
     {
         let args: Vec<String> = std::env::args().skip(1).collect();
-        // 无界面缓存自检：
-        //   mcworld-app <存档> --cache-test
-        // 保存一份缓存 → 立刻读回 → 对比指纹，验证整条链路。
+        // 无界面"生成缓存"：
+        //   mcworld-app <存档> --cache-test [--no-save]
+        //
+        // 真正采样每个区块并写入缩略图缓存（含群系），然后读回校验。
+        // 可以直接用来预热缓存 —— 之后导出 HTML 会走缓存快得多。
         if args.iter().any(|a| a == "--cache-test") {
             let no_save = args.iter().any(|a| a == "--no-save");
             let save = args.first().cloned().unwrap_or_default();
             if save.is_empty() {
-                eprintln!("用法: mcworld-app <存档> --cache-test");
+                eprintln!("用法: mcworld-app <存档> --cache-test [--no-save]");
                 std::process::exit(2);
             }
             let root = std::path::Path::new(&save);
@@ -1367,6 +1408,7 @@ fn main() -> eframe::Result<()> {
             };
             let dv = world.level.data_version();
             let mut any = false;
+
             for dim in &world.dimensions {
                 if !dim.exists(mcworld_core::world::RegionKind::Terrain) {
                     continue;
@@ -1377,18 +1419,47 @@ fn main() -> eframe::Result<()> {
                 }
                 any = true;
 
-                // 造几块假缩略图（16x16 RGBA），模拟已渲染的区块
-                let mut tiles: Vec<((i32, i32), Vec<u8>)> = Vec::new();
-                for (i, m) in metas.iter().take(50).enumerate() {
+                let t0 = std::time::Instant::now();
+                let mut rcache = mcworld_core::world::RegionCache::new(64);
+                let mut tiles: Vec<((i32, i32), Vec<u8>, Option<String>)> =
+                    Vec::with_capacity(metas.len());
+                let mut ok = 0usize;
+
+                for m in &metas {
+                    let Some(surf) = world.chunk_surface(
+                        dim,
+                        m.x,
+                        m.z,
+                        &mut rcache,
+                        mcworld_core::chunk::SliceMode::Surface,
+                    ) else {
+                        continue;
+                    };
+                    ok += 1;
+
+                    // 16×16 RGBA，与程序内渲染用的缩略图一致
                     let mut px = vec![0u8; 16 * 16 * 4];
-                    for q in px.chunks_exact_mut(4) {
-                        q[0] = (i * 5) as u8;
-                        q[1] = 100;
-                        q[2] = 50;
-                        q[3] = 255;
+                    for (i, col) in surf.columns.iter().enumerate().take(256) {
+                        let c = if col.y < 0 {
+                            [0x2A, 0x2E, 0x38]
+                        } else {
+                            mcworld_core::colors::block_color(&col.block)
+                        };
+                        px[i * 4] = c[0];
+                        px[i * 4 + 1] = c[1];
+                        px[i * 4 + 2] = c[2];
+                        px[i * 4 + 3] = 0xFF;
                     }
-                    tiles.push(((m.x, m.z), px));
+
+                    let y = surf
+                        .columns
+                        .get(8 * 16 + 8)
+                        .map(|c| if c.y < 0 { 64 } else { c.y })
+                        .unwrap_or(64);
+                    let biome = world.biome_at(dim, m.x * 16 + 8, y, m.z * 16 + 8, &mut rcache);
+                    tiles.push(((m.x, m.z), px, biome));
                 }
+                let sample_secs = t0.elapsed().as_secs_f64();
 
                 let safe: String = dim
                     .id
@@ -1399,34 +1470,54 @@ fn main() -> eframe::Result<()> {
                 let region_dir = dim.dir(mcworld_core::world::RegionKind::Terrain);
                 let stamps = crate::cache::collect_stamps(&region_dir);
                 let meta = crate::cache::CacheMeta {
+                    format_version: crate::cache::FORMAT_VERSION,
                     dim_id: dim.id.clone(),
                     slice: "surface".into(),
                     data_version: dv,
                     regions: stamps,
-                    chunks: tiles.iter().map(|(k, _)| *k).collect(),
+                    chunks: tiles.iter().map(|(k, _, _)| *k).collect(),
                 };
-                let data: Vec<Vec<u8>> = tiles.iter().map(|(_, px)| px.clone()).collect();
+                let data: Vec<Vec<u8>> = tiles.iter().map(|(_, px, _)| px.clone()).collect();
+                let biomes: Vec<Option<String>> =
+                    tiles.iter().map(|(_, _, b)| b.clone()).collect();
+
+                println!(
+                    "[{}] 采样 {}/{} 个区块，用时 {:.2}s",
+                    dim.display,
+                    ok,
+                    metas.len(),
+                    sample_secs
+                );
 
                 if !no_save {
-                if let Err(e) = crate::cache::save(&dir, &meta, &data) {
-                    eprintln!("[{}] 保存失败: {e}", dim.display);
-                    continue;
-                }
-                println!("[{}] 保存 {} 个区块缩略图 -> {}", dim.display, data.len(), dir.display());
+                    let t1 = std::time::Instant::now();
+                    if let Err(e) = crate::cache::save(&dir, &meta, &data, &biomes) {
+                        eprintln!("[{}] 保存失败: {e}", dim.display);
+                        continue;
+                    }
+                    println!(
+                        "[{}] 写入缓存 {} 个区块，用时 {:.2}s -> {}",
+                        dim.display,
+                        data.len(),
+                        t1.elapsed().as_secs_f64(),
+                        dir.display()
+                    );
                 }
 
                 match crate::cache::load(&dir) {
-                    Some((m2, t2)) => {
-                        println!("[{}] 读回 {} 区块, dim={}, dv={}", dim.display, t2.len(), m2.dim_id, m2.data_version);
+                    Some((m2, t2, b2)) => {
                         let now = crate::cache::collect_stamps(&region_dir);
                         let changed = m2.changed_regions(&now);
+                        println!(
+                            "[{}] 读回 {} 区块 / {} 群系，指纹变化 {}",
+                            dim.display,
+                            t2.len(),
+                            b2.iter().filter(|x| x.is_some()).count(),
+                            changed.len()
+                        );
                         if changed.is_empty() {
                             println!("[{}] OK 指纹一致，可直接复用", dim.display);
-                        } else {
-                            println!("[{}] WARN 检测到 {} 个 region 变化", dim.display, changed.len());
                         }
-                        println!("[{}] OK 首块像素 {} {} {} {}", dim.display,
-                            t2[0][0], t2[0][1], t2[0][2], t2[0][3]);
                     }
                     None => println!("[{}] FAIL 读回失败", dim.display),
                 }
@@ -1487,6 +1578,12 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+
+/// 区块数超过这个值时，打开存档会提示"可以保存缩略图缓存"。
+///
+/// 原来定的是 2000，但实测 2000~8000 这个区间用视口加载也就几秒钟，
+/// 弹提示反而烦人。8000 以上才真的会明显变慢。
+pub const CACHE_PROMPT_THRESHOLD: usize = 8000;
 
 /// 切片方式的稳定字符串表示（缓存指纹用）。
 fn slice_key(mode: &mcworld_core::chunk::SliceMode) -> String {

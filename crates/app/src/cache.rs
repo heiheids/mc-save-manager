@@ -39,9 +39,17 @@ pub struct RegionStamp {
     pub mtime: i64,
 }
 
+/// 缓存格式版本。
+///
+/// 存档格式变了就 +1，旧缓存会被整体丢弃（而不是解析出错）。
+/// v1 = 只有缩略图；v2 = 增加群系数据。
+pub const FORMAT_VERSION: i32 = 2;
+
 /// 缓存的元信息。
 #[derive(Clone, Debug, Default)]
 pub struct CacheMeta {
+    /// 写入时的 FORMAT_VERSION。
+    pub format_version: i32,
     pub dim_id: String,
     /// 采样时用的切片方式（Surface / Fixed(y)）。换了方式缓存就作废。
     pub slice: String,
@@ -147,6 +155,7 @@ pub fn save(
     dir: &Path,
     meta: &CacheMeta,
     tiles: &[Vec<u8>],
+    biomes: &[Option<String>],
 ) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("创建缓存目录失败: {e}"))?;
 
@@ -161,9 +170,24 @@ pub fn save(
     std::fs::write(dir.join("tiles.bin"), &bin)
         .map_err(|e| format!("写入 tiles.bin 失败: {e}"))?;
 
+    // biomes.txt：每行 "cx,cz,biome"，没有群系就写 "-"
+    {
+        let mut txt = String::with_capacity(meta.chunks.len() * 32);
+        for (i, (cx, cz)) in meta.chunks.iter().enumerate() {
+            let b = biomes
+                .get(i)
+                .and_then(|x| x.as_deref())
+                .unwrap_or("-");
+            txt.push_str(&format!("{cx},{cz},{b}\n"));
+        }
+        std::fs::write(dir.join("biomes.txt"), txt)
+            .map_err(|e| format!("写入 biomes.txt 失败: {e}"))?;
+    }
+
     // meta.json（手写，不引 serde）
     let mut js = String::new();
     js.push_str("{\n");
+    js.push_str(&format!("  \"v\": {},\n", FORMAT_VERSION));
     js.push_str(&format!("  \"dim\": {},\n", json_str(&meta.dim_id)));
     js.push_str(&format!("  \"slice\": {},\n", json_str(&meta.slice)));
     js.push_str(&format!("  \"data_version\": {},\n", meta.data_version));
@@ -212,9 +236,15 @@ fn json_str(s: &str) -> String {
 /// 读取缓存。返回 (meta, 每区块的缩略图)。
 ///
 /// 任何一项对不上就返回 None（当作没有缓存，重新采样）。
-pub fn load(dir: &Path) -> Option<(CacheMeta, Vec<Vec<u8>>)> {
+pub fn load(dir: &Path) -> Option<(CacheMeta, Vec<Vec<u8>>, Vec<Option<String>>)> {
     let js = std::fs::read_to_string(dir.join("meta.json")).ok()?;
     let meta = parse_meta(&js)?;
+
+    // 格式版本不符（例如老版本写的缓存没有群系）→ 整体作废，
+    // 让调用方重新采样并写一份新的。
+    if meta.format_version != FORMAT_VERSION {
+        return None;
+    }
 
     let bin = std::fs::read(dir.join("tiles.bin")).ok()?;
     if bin.len() != meta.chunks.len() * TILE_BYTES {
@@ -225,7 +255,28 @@ pub fn load(dir: &Path) -> Option<(CacheMeta, Vec<Vec<u8>>)> {
         .chunks_exact(TILE_BYTES)
         .map(|c| c.to_vec())
         .collect();
-    Some((meta, tiles))
+
+    // biomes.txt 可选：缺了就当没有群系信息，不影响缩略图复用
+    let biomes = std::fs::read_to_string(dir.join("biomes.txt"))
+        .map(|txt| {
+            let mut out: Vec<Option<String>> = Vec::new();
+            for line in txt.lines() {
+                // cx,cz,biome —— 群系 id 里不含逗号，按两次切分即可
+                let mut it = line.splitn(3, ',');
+                let _cx = it.next();
+                let _cz = it.next();
+                match it.next() {
+                    Some(b) if b != "-" && !b.is_empty() => {
+                        out.push(Some(b.to_string()))
+                    }
+                    _ => out.push(None),
+                }
+            }
+            out
+        })
+        .unwrap_or_default();
+
+    Some((meta, tiles, biomes))
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +289,7 @@ fn parse_meta(js: &str) -> Option<CacheMeta> {
     meta.dim_id = extract_str(js, "\"dim\"")?;
     meta.slice = extract_str(js, "\"slice\"").unwrap_or_default();
     meta.data_version = extract_int(js, "\"data_version\"").unwrap_or(0) as i32;
+    meta.format_version = extract_int(js, "\"v\"").unwrap_or(0) as i32;
 
     // regions: 逐个 {"rx":..,"rz":..,"size":..,"mtime":..}
     let reg_block = slice_between(js, "\"regions\"", "\"chunks\"")?;
