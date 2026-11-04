@@ -35,6 +35,8 @@ pub enum JobResult {
     },
     /// 缓存已读回：可直接复用这些缩略图
     CacheLoaded {
+        /// 发起这次任务的标签页，用来把结果送回**原来的存档**。
+        tab_id: usize,
         dimension: String,
         /// 可以复用的区块 → 16×16 RGBA
         tiles: Vec<((i32, i32), Vec<u8>)>,
@@ -48,6 +50,7 @@ pub enum JobResult {
     },
     /// 扫描完成：区块元数据 + 实体 + 方块实体
     Scanned {
+        tab_id: usize,
         dimension: String,
         chunks: Vec<ChunkMeta>,
         entities: Vec<EntityMeta>,
@@ -56,11 +59,13 @@ pub enum JobResult {
     },
     /// 局部重扫完成（删除 / 粘贴后的范围刷新）
     ScannedRange {
+        tab_id: usize,
         dimension: String,
         chunks: Vec<ChunkMeta>,
     },
     /// 地图采样完成一批
     Sampled {
+        tab_id: usize,
         dimension: String,
         surfaces: Vec<mcworld_core::ChunkSurface>,
         /// 本批里"查不到数据"的区块坐标。
@@ -91,7 +96,11 @@ pub enum JobResult {
     /// 导入 .smclip 完成
     SmclipImported { clipboard: ChunkClipboard, message: String },
     /// 出错
-    Failed(String),
+    Failed {
+        /// 发起任务的是哪个标签页（导出/复制这类与单个存档视图无关的为 None）。
+        tab_id: Option<usize>,
+        error: String,
+    },
     /// 简单提示
     Info(String),
 }
@@ -176,7 +185,7 @@ impl Jobs {
     }
 
     /// 启动扫描任务。
-    pub fn spawn_scan(&mut self, world_root: PathBuf, dim: Dimension) {
+    pub fn spawn_scan(&mut self, tab_id: usize, world_root: PathBuf, dim: Dimension) {
         let (tx, rx) = channel();
         let id = self.next_id;
         self.next_id += 1;
@@ -243,6 +252,7 @@ impl Jobs {
                 types.sort_by(|a, b| b.1.cmp(&a.1));
 
                 let _ = tx.send(JobResult::Scanned {
+                        tab_id,
                     dimension: dim.id.clone(),
                     chunks,
                     entities,
@@ -254,7 +264,7 @@ impl Jobs {
 
             match result {
                 Ok(()) => {}
-                Err(e) => { let _ = tx.send(JobResult::Failed(e)); }
+                Err(e) => { let _ = tx.send(JobResult::Failed { tab_id: Some(tab_id), error: e }); }
             }
         });
 
@@ -275,6 +285,7 @@ impl Jobs {
     /// 所以比全量扫描快得多。
     pub fn spawn_scan_range(
         &mut self,
+        tab_id: usize,
         world_root: PathBuf,
         dim: Dimension,
         x0: i32,
@@ -329,6 +340,7 @@ impl Jobs {
                 }
 
                 let _ = tx.send(JobResult::ScannedRange {
+                        tab_id,
                     dimension: dim.id.clone(),
                     chunks: fresh,
                 });
@@ -336,7 +348,7 @@ impl Jobs {
             })();
 
             if let Err(e) = result {
-                let _ = tx.send(JobResult::Failed(e));
+                let _ = tx.send(JobResult::Failed { tab_id: Some(tab_id), error: e });
             }
         });
 
@@ -351,6 +363,7 @@ impl Jobs {
 
     pub fn spawn_sample(
         &mut self,
+        tab_id: usize,
         world_root: PathBuf,
         dim: Dimension,
         chunks: Vec<(i32, i32)>,
@@ -385,6 +398,7 @@ impl Jobs {
                     if batch.len() >= 128 || miss_batch.len() >= 256 || i + 1 == total {
                         let complete = i + 1 == total;
                         let _ = tx.send(JobResult::Sampled {
+                            tab_id,
                             dimension: dim.id.clone(),
                             surfaces: std::mem::take(&mut batch),
                             missing: std::mem::take(&mut miss_batch),
@@ -407,7 +421,7 @@ impl Jobs {
             })();
 
             if let Err(e) = result {
-                let _ = tx.send(JobResult::Failed(e));
+                let _ = tx.send(JobResult::Failed { tab_id: Some(tab_id), error: e });
             }
         });
 
@@ -534,6 +548,7 @@ impl Jobs {
     /// 和"需要重算的区块"分开返回。
     pub fn spawn_load_cache(
         &mut self,
+        tab_id: usize,
         save_root: PathBuf,
         dim_id: String,
         region_dir: PathBuf,
@@ -558,6 +573,7 @@ impl Jobs {
 
             let Some((meta, tiles, _biomes)) = loaded else {
                 let _ = tx.send(JobResult::CacheLoaded {
+                    tab_id,
                     dimension: dim_id,
                     tiles: Vec::new(),
                     stale: Vec::new(),
@@ -569,6 +585,7 @@ impl Jobs {
             // 切片方式或数据版本变了 → 整份作废
             if meta.slice != slice || meta.data_version != data_version {
                 let _ = tx.send(JobResult::CacheLoaded {
+                    tab_id,
                     dimension: dim_id,
                     tiles: Vec::new(),
                     stale: Vec::new(),
@@ -595,6 +612,7 @@ impl Jobs {
             }
 
             let _ = tx.send(JobResult::CacheLoaded {
+                tab_id,
                 dimension: dim_id,
                 tiles: good,
                 stale,
@@ -662,7 +680,7 @@ impl Jobs {
             })();
 
             if let Err(e) = result {
-                let _ = tx.send(JobResult::Failed(e));
+                let _ = tx.send(JobResult::Failed { tab_id: None, error: e });
             }
         });
 
@@ -777,7 +795,7 @@ impl Jobs {
             match result {
                 Ok(()) => {}
                 Err(e) => {
-                    let _ = tx.send(JobResult::Failed(e));
+                    let _ = tx.send(JobResult::Failed { tab_id: None, error: e });
                 }
             }
         });
@@ -825,7 +843,7 @@ impl Jobs {
 
             match result {
                 Ok(()) => {}
-                Err(e) => { let _ = tx.send(JobResult::Failed(e)); }
+                Err(e) => { let _ = tx.send(JobResult::Failed { tab_id: None, error: e }); }
             }
         });
 
@@ -966,7 +984,7 @@ impl Jobs {
             })();
 
             if let Err(e) = result {
-                let _ = tx.send(JobResult::Failed(e));
+                let _ = tx.send(JobResult::Failed { tab_id: None, error: e });
             }
         });
 
@@ -1035,7 +1053,7 @@ impl Jobs {
             })();
 
             if let Err(e) = result {
-                let _ = tx.send(JobResult::Failed(e));
+                let _ = tx.send(JobResult::Failed { tab_id: None, error: e });
             }
         });
 
@@ -1094,6 +1112,7 @@ mod lifecycle_tests {
         let _ = std::fs::create_dir_all(&tmp);
 
         jobs.spawn_load_cache(
+            1, // tab_id
             tmp.clone(),
             "minecraft:overworld".to_string(),
             tmp.join("region"),
@@ -1162,6 +1181,36 @@ mod lifecycle_tests {
         assert!(jobs.jobs.is_empty(), "结束的任务应被移出列表");
     }
 
+    /// 任务结果必须带回发起它的 `tab_id`。
+    ///
+    /// 没有这个字段时，后台任务完成后会被写进"当前激活的标签页"——
+    /// 用户开着 A 存档、后台还在采样，这时打开 B，A 的缩略图就会画到 B 上
+    /// （区块坐标重合，看起来就是"新存档残留了旧存档的图像"）。
+    #[test]
+    fn job_result_carries_tab_id() {
+        let mut jobs = Jobs::default();
+        let tmp = std::env::temp_dir().join("mcworld_test_tab_id");
+        let _ = std::fs::create_dir_all(&tmp);
+
+        jobs.spawn_load_cache(
+            42,
+            tmp,
+            "minecraft:overworld".into(),
+            std::path::PathBuf::from("/nonexistent/region"),
+            "surface".into(),
+            0,
+        );
+
+        let got = drain(&mut jobs);
+        assert_eq!(got.len(), 1);
+        match &got[0] {
+            JobResult::CacheLoaded { tab_id, .. } => {
+                assert_eq!(*tab_id, 42, "结果必须带回发起任务的 tab_id");
+            }
+            _ => panic!("应当是 CacheLoaded"),
+        }
+    }
+
     /// 成功完成的任务必须被清理，不能永远留在列表里。
     #[test]
     fn finished_jobs_are_removed() {
@@ -1170,6 +1219,7 @@ mod lifecycle_tests {
         let _ = std::fs::create_dir_all(&tmp);
 
         jobs.spawn_load_cache(
+            2, // tab_id
             tmp,
             "minecraft:the_end".to_string(),
             std::path::PathBuf::from("/nonexistent/region"),

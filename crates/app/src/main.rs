@@ -112,6 +112,12 @@ impl Default for DimView {
 
 /// 一个已打开的存档标签页。
 pub struct WorldTab {
+    /// 标签页的稳定身份。
+    ///
+    /// 后台任务完成时可能已经切到别的存档了，必须靠它把结果送回
+    /// **发起任务的那个存档**，而不是"当前激活的那个"。
+    /// 否则新存档会显示旧存档的缩略图（区块坐标重合，看起来就是"残留"）。
+    pub id: usize,
     pub world: World,
     pub path: PathBuf,
     pub name: String,
@@ -159,6 +165,11 @@ pub struct WorldTab {
 
 impl WorldTab {
     pub fn new(world: World, path: PathBuf) -> Self {
+        // 进程内单调递增，保证同一时刻不会有两个标签页用到同一个 id
+        static NEXT_TAB_ID: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(1);
+        let id = NEXT_TAB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         // 先把需要的字段全部取出来，再移动 world（否则借用后无法 move）
         let name = world.level.level_name();
         let edit_name = name.clone();
@@ -180,6 +191,7 @@ impl WorldTab {
         };
 
         WorldTab {
+            id,
             world,
             path,
             name,
@@ -584,7 +596,7 @@ impl App {
         }
         let Some(dim) = tab.dim().cloned() else { return };
         let root = tab.path.clone();
-        self.jobs.spawn_scan(root, dim);
+        self.jobs.spawn_scan(tab.id, root, dim);
     }
 
     /// 重载存档：丢弃所有维度的扫描结果与地图缓存，重新从磁盘读取。
@@ -678,6 +690,15 @@ impl App {
     ///
     /// 已经被采样过的区块只存在于 `DimView::map`（缩略图纹理）里，
     /// 原始区块数据早就释放了，所以这里只需要查纹理缓存就能判断"要不要加载"。
+    /// 按 id 找标签页。
+    ///
+    /// 后台任务的结果必须走这里，而不是 `tab_mut()`（当前的激活页）——
+    /// 任务跑的过程中用户可能已经切走或打开了别的存档，
+    /// 直接写进激活页会把旧存档的缩略图画到新存档上。
+    pub fn tab_by_id(&mut self, id: usize) -> Option<&mut WorldTab> {
+        self.tabs.iter_mut().find(|t| t.id == id)
+    }
+
     pub fn request_viewport_sample(&mut self, viewport: Option<egui::Rect>) {
         self.request_viewport_sample_r(viewport, Self::INITIAL_RADIUS);
     }
@@ -767,7 +788,7 @@ impl App {
         }
 
         let root = tab.path.clone();
-        self.jobs.spawn_sample(root, dim, need, mode);
+        self.jobs.spawn_sample(tab.id, root, dim, need, mode);
     }
 
 
@@ -827,6 +848,7 @@ impl App {
         for r in results {
             match r {
                 JobResult::Scanned {
+                    tab_id,
                     dimension,
                     chunks,
                     entities,
@@ -868,7 +890,7 @@ impl App {
                         })
                         .collect();
 
-                    if let Some(tab) = self.tab_mut() {
+                    if let Some(tab) = self.tab_by_id(tab_id) {
                         tab.chunks.insert(dimension.clone(), chunks);
                         tab.entities.insert(dimension.clone(), entities);
                         tab.block_entities
@@ -885,10 +907,14 @@ impl App {
                         ),
                         StatusKind::Success,
                     );
-                    self.request_sample();
+                    // 只有这个存档仍是当前页时才继续首屏采样。
+                    // 否则会给"现在看着的那个存档"重复触发一轮加载。
+                    if self.tabs.get(self.active).map(|t| t.id) == Some(tab_id) {
+                        self.request_sample();
+                    }
                 }
-                JobResult::ScannedRange { dimension, chunks } => {
-                    if let Some(tab) = self.tab_mut() {
+                JobResult::ScannedRange { tab_id, dimension, chunks } => {
+                    if let Some(tab) = self.tab_by_id(tab_id) {
                         // 把重扫到的区块并回索引（按坐标去重）
                         let list = tab.chunks.entry(dimension.clone()).or_default();
                         list.retain(|c| {
@@ -898,13 +924,13 @@ impl App {
                         list.sort_unstable_by_key(|c| (c.z, c.x));
                     }
                     // 重新排队采样（纹理已被 drop_range 清掉）
-                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                    if let Some(tab) = self.tab_by_id(tab_id) {
                         tab.view_mut().last_view_center = None;
                     }
                 }
-                JobResult::Sampled { dimension, surfaces, missing, complete } => {
+                JobResult::Sampled { tab_id, dimension, surfaces, missing, complete } => {
                     let loaded = surfaces.len();
-                    if let Some(tab) = self.tab_mut() {
+                    if let Some(tab) = self.tab_by_id(tab_id) {
                         // 纹理写进该维度自己的缓存；即使当前已切到别的维度也能正常保存。
                         // 写完纹理就不再需要原始区块数据了，chunk_surface 返回的
                         // ChunkSurface 在下一批里自然释放 —— 这就是"缩略图化"。
@@ -1040,6 +1066,7 @@ impl App {
                     self.set_status(format!("保存缓存失败: {error}"), StatusKind::Error);
                 }
                 JobResult::CacheLoaded {
+                    tab_id,
                     dimension,
                     tiles,
                     stale,
@@ -1048,12 +1075,16 @@ impl App {
                     // 没有可用缓存：直接走常规扫描，别把视图标成"已采样"，
                     // 否则首屏会既没有缩略图也不触发采样，一片黑。
                     if !hit {
-                        self.request_viewport_sample(None);
+                        // 只对当前页补采样；其它存档等用户切过去时
+                        // （它的 last_view_center 还是 None）自然会重新请求。
+                        if self.tabs.get(self.active).map(|t| t.id) == Some(tab_id) {
+                            self.request_viewport_sample(None);
+                        }
                         return;
                     }
                     let reused = tiles.len();
                     let stale_n = stale.len();
-                    if let Some(tab) = self.tab_mut() {
+                    if let Some(tab) = self.tab_by_id(tab_id) {
                         let v = tab.ensure_view(&dimension);
                         for (key, px) in &tiles {
                             v.map.insert_from_pixels(ctx, *key, px.clone());
@@ -1084,14 +1115,20 @@ impl App {
                 JobResult::HtmlExportFailed { error } => {
                     self.set_status(format!("导出失败: {error}"), StatusKind::Error);
                 }
-                JobResult::Failed(e) => {
-                    self.set_status(format!("操作失败: {e}"), StatusKind::Error);
+                JobResult::Failed { tab_id, error } => {
+                    self.set_status(format!("操作失败: {error}"), StatusKind::Error);
                     // 任务失败时 pending 里的区块不会有任何回包，
                     // 必须主动清掉，否则"加载中"会永久挂在屏幕上。
-                    if let Some(tab) = self.tabs.get_mut(self.active) {
-                        let v = tab.view_mut();
-                        v.pending.clear();
-                        v.loading = false;
+                    //
+                    // 只清**发起任务的**那个标签页：否则 A 存档的采样失败
+                    // 会把 B 存档的 pending 一起清掉，B 的进度条会凭空消失，
+                    // 而没加载完的区块再也没人重试。
+                    if let Some(id) = tab_id {
+                        if let Some(tab) = self.tab_by_id(id) {
+                            let v = tab.view_mut();
+                            v.pending.clear();
+                            v.loading = false;
+                        }
                     }
                 }
                 JobResult::Info(m) => self.set_status(m, StatusKind::Info),
@@ -1116,7 +1153,7 @@ impl App {
         };
         let root = tab.path.clone();
         tab.view_mut().loading = true;
-        self.jobs.spawn_sample(root, dim, need, mode);
+        self.jobs.spawn_sample(tab.id, root, dim, need, mode);
     }
 
     /// 触发一次"保存缓存"。
@@ -1175,7 +1212,7 @@ impl App {
         let region_dir = dim.dir(mcworld_core::world::RegionKind::Terrain);
 
         self.jobs
-            .spawn_load_cache(save_root, dim.id, region_dir, slice, dv);
+            .spawn_load_cache(tab.id, save_root, dim.id, region_dir, slice, dv);
     }
 
     /// 局部刷新：只重扫指定区块范围（外扩 `REFRESH_MARGIN` 圈）。
@@ -1220,7 +1257,7 @@ impl App {
             None => return,
         };
         let root = tab.path.clone();
-        self.jobs.spawn_scan_range(root, dim, rx0, rz0, rx1, rz1);
+        self.jobs.spawn_scan_range(tab.id, root, dim, rx0, rz0, rx1, rz1);
     }
 
     fn refresh_current(&mut self) {
