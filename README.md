@@ -12,7 +12,7 @@
 > level without needing the game running. Supports **1.21.1** through
 > **26.4 snapshots**. [Jump to English](#english)
 
-![版本](https://img.shields.io/badge/version-1.0.8-brightgreen)
+![版本](https://img.shields.io/badge/version-1.0.9-brightgreen)
 ![协议](https://img.shields.io/badge/license-GPL--3.0-blue)
 
 **中文** | [English](#english)
@@ -193,6 +193,19 @@ docs/
 
 ---
 
+## 末地折跃门保护
+
+折跃门（`minecraft:end_gateway`）是**方块 + 方块实体**，数据就存在区块里。
+删除区块会连门一起删掉，而且无法恢复（除非再击杀一次末影龙）。
+
+所以删除区块前会先扫描一次：如果选区内有折跃门，会弹出提示，列出**具体哪些
+区块不会被删除**、门在什么坐标，并给出两个选择：
+
+- **跳过并删除** —— 保留含折跃门的区块，只删除其余区块（默认）
+- **强制全部删除** —— 连这些区块一起删，折跃门永久消失
+
+折跃门只存在于末地，其它维度不做这项扫描，删除速度不受影响。
+
 ## 杀毒软件误报
 
 本程序是**未签名**的独立可执行文件，且下载量小，Windows Defender 等
@@ -251,7 +264,7 @@ A Minecraft save editor written in Rust. It edits the world directly at the
 save-file level — no need for the game to be running. Supports **1.21.1**
 through **26.4 snapshots**.
 
-![version](https://img.shields.io/badge/version-1.0.8-brightgreen)
+![version](https://img.shields.io/badge/version-1.0.9-brightgreen)
 ![license](https://img.shields.io/badge/license-GPL--3.0-blue)
 
 ---
@@ -443,6 +456,22 @@ docs/
 ```
 
 ---
+
+## End gateway protection
+
+An end gateway (`minecraft:end_gateway`) is a **block plus a block entity**, and
+the data lives inside the chunk. Deleting the chunk deletes the gateway with it,
+and it cannot be recovered (short of killing the Ender Dragon again).
+
+So before deleting chunks the program scans the selection. If it contains any
+gateways, a dialog lists **exactly which chunks will not be deleted** and where
+the gateways are, and offers two choices:
+
+- **Skip and delete** — keep the gateway chunks, delete the rest (default)
+- **Force delete everything** — delete those chunks too; the gateways are gone
+
+Gateways only exist in the End, so other dimensions skip the scan entirely and
+deletion speed is unaffected.
 
 ## Antivirus false positives
 

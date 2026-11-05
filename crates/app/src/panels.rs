@@ -341,6 +341,7 @@ pub fn toolbar(app: &mut App, ctx: &egui::Context) {
                                     .and_then(|t| t.dim().map(|d| d.display.clone()))
                                     .unwrap_or_default(),
                                 targets,
+                                force: false,
                             });
                         }
                     });
@@ -1840,12 +1841,14 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
     if let Some(action) = app.pending_confirm.take() {
         let mut confirmed = false;
         let mut cancelled = false;
+        let mut force = false;
 
         let (title, desc) = match &action {
             ConfirmAction::DeleteChunks {
                 count,
                 dim,
                 targets,
+                ..
             } => {
                 let ranges: Vec<String> = targets
                     .iter()
@@ -1861,6 +1864,29 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
                     format!(
                         "将删除 {dim} 的 {count} 个区块，共 {} 处选区。\n范围：\n{lines}\n\n区块内的方块、方块实体、实体与 POI 都会一并清除。\n\n操作前会自动备份，之后可用工具栏的「撤销」还原。",
                         targets.len()
+                    ),
+                )
+            }
+            ConfirmAction::DeleteChunksBlocked { safe, blocked, dim, .. } => {
+                let mut lines = String::new();
+                for (i, (cx, cz, gx, gz)) in blocked.iter().enumerate() {
+                    if i >= 10 {
+                        lines.push_str(&format!("\n… 还有 {} 个", blocked.len() - 10));
+                        break;
+                    }
+                    lines.push_str(&format!("\n  区块 ({cx}, {cz})   折跃门 @ ({gx}, {gz})"));
+                }
+                (
+                    "这些区块含末地折跃门".to_string(),
+                    format!(
+                        "检测到 {n} 个区块含末地折跃门（minecraft:end_gateway）。\n\n\
+                         折跃门的数据就存在区块里，删除区块会连门一起删掉，\n\
+                         而且无法恢复（除非再击杀一次末影龙）。\n\n\
+                         默认会跳过这些区块：{lines}\n\n\
+                         其余 {k} 个区块可以正常删除。\n\n\
+                         也可以选择强制全部删除，那样折跃门会永久消失。",
+                        n = blocked.len(),
+                        k = safe.len(),
                     ),
                 )
             }
@@ -1898,6 +1924,8 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
                 ui.set_min_width(360.0);
                 ui.label(desc);
                 ui.add_space(12.0);
+                let is_blocked =
+                    matches!(&action, ConfirmAction::DeleteChunksBlocked { .. });
                 ui.horizontal(|ui| {
                     if ui
                         .add(egui::Button::new(
@@ -1908,7 +1936,27 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
                         cancelled = true;
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
+                        if is_blocked {
+                            // 强制删除：连含折跃门的区块一起删
+                            if ui
+                                .add(egui::Button::new(
+                                    RichText::new("强制全部删除").color(Color32::WHITE),
+                                ).fill(theme::DANGER))
+                                .on_hover_text("连含末地折跃门的区块一起删除，折跃门将永久消失")
+                                .clicked()
+                            {
+                                force = true;
+                            }
+                            if ui
+                                .add(egui::Button::new(
+                                    RichText::new("跳过并删除").color(Color32::WHITE),
+                                ).fill(theme::ACCENT))
+                                .on_hover_text("保留含折跃门的区块，只删除其余区块")
+                                .clicked()
+                            {
+                                confirmed = true;
+                            }
+                        } else if ui
                             .add(egui::Button::new(
                                 RichText::new("确认执行").color(Color32::WHITE),
                             ).fill(theme::DANGER))
@@ -1920,12 +1968,32 @@ pub fn windows(app: &mut App, ctx: &egui::Context) {
                 });
             });
 
-        if confirmed {
+        if force {
+            execute_confirmed(app, force_all(action));
+        } else if confirmed {
             execute_confirmed(app, action);
         } else if !cancelled {
             // 用户还没决定，把动作放回
             app.pending_confirm = Some(action);
         }
+    }
+}
+
+/// 用户点了「强制全部删除」：直接用原始选区重跑，但跳过折跃门检查。
+///
+/// 关键在于把 `force` 置 true。否则重新执行时会再扫一遍折跃门、
+/// 再弹一次同一个确认框 —— 用户会陷在对话框里出不来。
+fn force_all(action: ConfirmAction) -> ConfirmAction {
+    match action {
+        ConfirmAction::DeleteChunksBlocked {
+            targets, count, dim, ..
+        } => ConfirmAction::DeleteChunks {
+            count,
+            dim,
+            targets,
+            force: true,
+        },
+        other => other,
     }
 }
 
@@ -1945,8 +2013,7 @@ fn execute_confirmed(app: &mut App, action: ConfirmAction) {
                 Err(e) => app.set_status(format!("保存失败: {e}"), StatusKind::Error),
             }
         }
-        ConfirmAction::DeleteChunks { count, targets, .. } => {
-            let Some(tab) = app.tab() else { return };
+        ConfirmAction::DeleteChunks { count, targets, force, .. } => {
             // 用确认框弹出时的快照坐标（可能有多处），不再依赖当前选区
             let mut chunks = Vec::new();
             for (x0, z0, x1, z1) in &targets {
@@ -1959,8 +2026,57 @@ fn execute_confirmed(app: &mut App, action: ConfirmAction) {
             // 多个选区可能有重叠，去重后才能得到正确的"实际删除数"
             chunks.sort_unstable();
             chunks.dedup();
-            let Some(dim) = tab.dim().cloned() else { return };
-            let root = tab.path.clone();
+
+            // ---- 删除前的保护性检查：末地折跃门 ----
+            //
+            // 折跃门是方块 + 方块实体，数据就存在区块里。删掉区块必然连门一起
+            // 删掉，而门一旦没了只能再杀一次末影龙，基本等于不可恢复。
+            // 所以先扫一遍，发现问题就弹二次确认，默认跳过这些区块。
+            //
+            // 折跃门只存在于末地，其它维度直接跳过扫描，省掉几万次 NBT 解析。
+            //
+            // 注意：这里用块作用域把对 `app` 的不可变借用限制住，
+            // 否则后面写 `app.pending_confirm` / `app.jobs` 会冲突。
+            let prepared = {
+                let Some(tab) = app.tab() else { return };
+                let Some(dim) = tab.dim().cloned() else { return };
+                let root = tab.path.clone();
+
+                let mut blocked: Vec<(i32, i32, i32, i32)> = Vec::new();
+                if !force && dim.id.contains("the_end") {
+                    if let Ok(list) =
+                        tab.world.find_block_entities(&dim, &chunks, "end_gateway")
+                    {
+                        for b in &list {
+                            blocked.push((b.chunk.0, b.chunk.1, b.pos.0, b.pos.2));
+                        }
+                        blocked.sort_unstable();
+                        blocked.dedup_by_key(|b| (b.0, b.1));
+                    }
+                }
+                (dim, root, blocked)
+            };
+            let (dim, root, blocked) = prepared;
+
+            if !blocked.is_empty() {
+                let blocked_set: std::collections::HashSet<(i32, i32)> =
+                    blocked.iter().map(|b| (b.0, b.1)).collect();
+                let safe: Vec<(i32, i32)> = chunks
+                    .iter()
+                    .copied()
+                    .filter(|c| !blocked_set.contains(c))
+                    .collect();
+                // 把选择权交给用户：跳过这些区块 / 强制全部删除
+                app.pending_confirm = Some(ConfirmAction::DeleteChunksBlocked {
+                    safe,
+                    blocked,
+                    targets,
+                    count,
+                    dim: dim.display.clone(),
+                });
+                return;
+            }
+
             let n_sel = targets.len();
             app.jobs.spawn_delete_chunks(root, dim, chunks, true, true);
             if n_sel > 1 {
@@ -1971,6 +2087,29 @@ fn execute_confirmed(app: &mut App, action: ConfirmAction) {
             } else {
                 app.set_status(format!("正在删除 {count} 个区块…"), StatusKind::Info);
             }
+        }
+
+        ConfirmAction::DeleteChunksBlocked { safe, dim, .. } => {
+            // 用户选择「跳过并删除」：只删不含折跃门的区块
+            if safe.is_empty() {
+                app.set_status(
+                    "这些区块全都含末地折跃门，没有可删除的部分",
+                    StatusKind::Info,
+                );
+                return;
+            }
+            let (root, d) = {
+                let Some(tab) = app.tab() else { return };
+                let Some(d) = tab.dim().cloned() else { return };
+                (tab.path.clone(), d)
+            };
+            let n = safe.len();
+            app.jobs.spawn_delete_chunks(root, d, safe, true, true);
+            app.set_status(
+                format!("正在删除 {n} 个区块（已跳过含末地折跃门的区块）"),
+                StatusKind::Info,
+            );
+            let _ = dim;
         }
         ConfirmAction::DeleteEntities { count, .. } => {
             let Some(tab) = app.tab() else { return };
@@ -2881,5 +3020,53 @@ fn job_title(label: &str) -> String {
         "导出全图 HTML".into()
     } else {
         label.to_string()
+    }
+}
+
+
+#[cfg(test)]
+mod gateway_guard_tests {
+    use super::*;
+
+    /// 「强制全部删除」必须置 force = true。
+    ///
+    /// 否则重新执行时会再扫一遍折跃门、再弹同一个确认框 ——
+    /// 用户点了"强制删除"却回到同一个对话框，永远出不来。
+    #[test]
+    fn force_all_sets_force_flag() {
+        let action = ConfirmAction::DeleteChunksBlocked {
+            safe: vec![(1, 2), (3, 4)],
+            blocked: vec![(-81, 169, -1293, 2715)],
+            targets: vec![(-100, 150, 0, 200)],
+            count: 3,
+            dim: "末地".into(),
+        };
+
+        match force_all(action) {
+            ConfirmAction::DeleteChunks {
+                force,
+                targets,
+                count,
+                ..
+            } => {
+                assert!(force, "force 必须为 true，否则会再次弹确认框");
+                assert_eq!(targets, vec![(-100, 150, 0, 200)], "应当沿用原始选区");
+                assert_eq!(count, 3);
+            }
+            _ => panic!("应当变成 DeleteChunks"),
+        }
+    }
+
+    /// 其它动作原样返回，不能被误改。
+    #[test]
+    fn force_all_leaves_other_actions_alone() {
+        let action = ConfirmAction::DeleteEntities {
+            count: 5,
+            dim: "主世界".into(),
+        };
+        match force_all(action) {
+            ConfirmAction::DeleteEntities { count, .. } => assert_eq!(count, 5),
+            _ => panic!("不该变类型"),
+        }
     }
 }

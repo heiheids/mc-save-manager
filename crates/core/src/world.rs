@@ -273,6 +273,17 @@ impl EntityMeta {
     }
 }
 
+/// 删除区块时会被顺带毁掉的方块实体（目前用于末地折跃门保护）。
+#[derive(Clone, Debug)]
+pub struct ProtectedBlockEntity {
+    /// 所在区块。
+    pub chunk: (i32, i32),
+    /// 方块实体所在的方块坐标。
+    pub pos: (i32, i32, i32),
+    /// 方块实体 id，例如 `minecraft:end_gateway`。
+    pub id: String,
+}
+
 /// 方块实体索引条目。
 #[derive(Clone, Debug)]
 pub struct BlockEntityMeta {
@@ -1114,6 +1125,74 @@ impl World {
                 }
             }
         }
+        Ok(out)
+    }
+
+    /// 找出给定区块里含指定方块实体的那些。
+    ///
+    /// 用途：删除区块前做保护性检查。末地折跃门（`minecraft:end_gateway`）
+    /// 是**方块 + 方块实体**，数据就存在区块里 —— 删掉区块就必然连门一起删掉，
+    /// 没有"删区块但留门"这种可能。所以只能反过来：跳过这些区块。
+    ///
+    /// `id_substr` 按子串匹配，例如传 `"end_gateway"`。
+    pub fn find_block_entities(
+        &self,
+        dim: &Dimension,
+        chunks: &[(i32, i32)],
+        id_substr: &str,
+    ) -> Result<Vec<ProtectedBlockEntity>> {
+        if chunks.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 按 region 分组，每个区域文件只打开一次
+        let mut by_region: std::collections::BTreeMap<(i32, i32), Vec<(i32, i32)>> =
+            Default::default();
+        for &(cx, cz) in chunks {
+            let key = (anvil::region_coord(cx), anvil::region_coord(cz));
+            by_region.entry(key).or_default().push((cx, cz));
+        }
+
+        let dir = dim.dir(RegionKind::Terrain);
+        let mut out = Vec::new();
+
+        for ((rx, rz), list) in by_region {
+            let path = dir.join(format!("r.{rx}.{rz}.mca"));
+            if !path.exists() {
+                continue;
+            }
+            let Ok(mut rf) = RegionFile::open(&path) else {
+                continue;
+            };
+
+            for (cx, cz) in list {
+                let Ok(Some(tag)) = rf.chunk(cx, cz) else {
+                    continue;
+                };
+                let Some(root) = tag.as_compound() else { continue };
+                let Some((_, bes)) = root.get("block_entities").and_then(|t| t.as_list()) else {
+                    continue;
+                };
+                for be in bes {
+                    let Some(bc) = be.as_compound() else { continue };
+                    let id = bc.get("id").and_then(|t| t.as_str()).unwrap_or("");
+                    if !id.contains(id_substr) {
+                        continue;
+                    }
+                    out.push(ProtectedBlockEntity {
+                        chunk: (cx, cz),
+                        pos: (
+                            bc.get("x").and_then(|t| t.as_i32()).unwrap_or(0),
+                            bc.get("y").and_then(|t| t.as_i32()).unwrap_or(0),
+                            bc.get("z").and_then(|t| t.as_i32()).unwrap_or(0),
+                        ),
+                        id: id.to_string(),
+                    });
+                }
+            }
+        }
+
+        out.sort_by_key(|b| (b.chunk, b.pos));
         Ok(out)
     }
 
