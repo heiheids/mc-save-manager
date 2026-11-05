@@ -163,6 +163,42 @@ jobs:
     permissions:
       contents: write
     steps:
+      # 需要仓库才能读到 annotated tag 的说明文字
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 发布说明 = annotated tag 的说明文字。
+      #
+      # 之前用的是 `generate_release_notes: true`，但它只会生成一行
+      # "Full Changelog" 比较链接 —— 没有 PR、没有 issue 标签时它
+      # 什么都写不出来，Release 页面等于没有更新日志。
+      #
+      # 现在改为直接取 tag 说明（`git tag -a -m "..."` 里写的内容），
+      # 这样每次发布前写好的更新说明会原样出现在 Release 页面。
+      - name: Build release notes from tag message
+        run: |
+          git tag -l --format=%(contents) "${GITHUB_REF_NAME}" > raw.md
+
+          # 首行如果只是版本号本身就去掉；如果写的是正文就原样保留。
+          if [ "$(head -1 raw.md)" = "${GITHUB_REF_NAME}" ]; then
+            tail -n +2 raw.md > body.md
+          else
+            cp raw.md body.md
+          fi
+
+          # 去掉首尾空行（中间的空行保留，Markdown 靠它分段）
+          awk 'NF==0 && !seen {next} {seen=1; buf[++n]=$0; if (NF) last=n}
+               END {for (i=1;i<=last;i++) print buf[i]}' body.md > release_notes.md
+
+          if [ ! -s release_notes.md ]; then
+            echo "版本 ${GITHUB_REF_NAME}" > release_notes.md
+          fi
+
+          echo "----- release notes -----"
+          cat release_notes.md
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -176,6 +212,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
-          generate_release_notes: true
+          body_path: release_notes.md
           draft: false
           prerelease: false
