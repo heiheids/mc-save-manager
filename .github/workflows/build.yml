@@ -163,23 +163,33 @@ jobs:
     permissions:
       contents: write
     steps:
-      # 需要仓库才能读到 annotated tag 的说明文字
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       # 发布说明 = annotated tag 的说明文字。
       #
-      # 之前用的是 `generate_release_notes: true`，但它只会生成一行
+      # 早期用的是 `generate_release_notes: true`，但它只会生成一行
       # "Full Changelog" 比较链接 —— 没有 PR、没有 issue 标签时它
       # 什么都写不出来，Release 页面等于没有更新日志。
       #
-      # 现在改为直接取 tag 说明（`git tag -a -m "..."` 里写的内容），
-      # 这样每次发布前写好的更新说明会原样出现在 Release 页面。
+      # 这里**刻意不用 git**：`actions/checkout` 取下来的标签可能是轻量标签，
+      # 那样 `git tag --format=%(contents)` 会静默回退成提交信息 ——
+      # Release 页面上就会出现"ci: 修复 xxx"这种开发者提交，而不是更新日志。
+      #
+      # 直接问 GitHub API 要 tag 对象里的 message，行为确定。
       - name: Build release notes from tag message
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > raw.md
+          REF="repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}"
+          TYPE=$(gh api "$REF" --jq .object.type)
+          echo "tag object type: $TYPE"
+
+          if [ "$TYPE" = "tag" ]; then
+            SHA=$(gh api "$REF" --jq .object.sha)
+            gh api "repos/${GITHUB_REPOSITORY}/git/tags/${SHA}" --jq .message > raw.md
+          else
+            # 轻量标签没有说明文字，退回"只有版本号"
+            : > raw.md
+          fi
 
           # 首行如果只是版本号本身就去掉；如果写的是正文就原样保留。
           if [ "$(head -1 raw.md)" = "${GITHUB_REF_NAME}" ]; then
