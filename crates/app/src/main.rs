@@ -690,6 +690,100 @@ impl App {
     ///
     /// 已经被采样过的区块只存在于 `DimView::map`（缩略图纹理）里，
     /// 原始区块数据早就释放了，所以这里只需要查纹理缓存就能判断"要不要加载"。
+    /// 反选：把当前选区在**可见范围内**的补集设为新的选区。
+    ///
+    /// 只在可视范围内反向 —— 屏幕外的区域不参与，否则缩小到看全图时
+    /// 一按反选就把整个世界都选进来了，既没意义又容易误删。
+    ///
+    /// 选区是矩形，矩形的补集一般不是矩形，所以结果是一组互不重叠的
+    /// 矩形。写入多选列表（`selections`）并自动打开多位置模式。
+    pub fn invert_selection(&mut self) -> Result<usize, String> {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return Err("还没有打开存档".into());
+        };
+
+        // ---- 第一步：只读地收集所有需要的信息 ----
+        // （先算完再改，否则 `ensure_view` 的可变借与会和只读查询打架）
+        let dim_id = tab.dim_id();
+        let (canvas, cam, current, confirmed, multi) = {
+            let v = tab.ensure_view(&dim_id);
+            (
+                v.canvas_size,
+                v.camera.clone(),
+                v.selection,
+                v.selections.clone(),
+                v.multi_select,
+            )
+        };
+
+        // 可见范围必须知道画布实际尺寸；还没画过就没法反选。
+        let Some((w, h)) = canvas else {
+            return Err("地图还没绘制，先等一下".into());
+        };
+        if w <= 1.0 || h <= 1.0 {
+            return Err("地图太小，无法确定可见范围".into());
+        }
+
+        let vp = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h));
+        let (vx0, vz0, vx1, vz1) = Self::visible_chunk_range(&cam, vp, 0);
+
+        // 和"本维度真实存在的区块"取交集：可见范围通常比世界大，
+        // 不裁的话反选结果会包含大片根本没有区块的空白。
+        let (wx0, wz0, wx1, wz1) = {
+            let mut a = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+            for c in tab.chunks_of_current() {
+                a.0 = a.0.min(c.x);
+                a.1 = a.1.min(c.z);
+                a.2 = a.2.max(c.x);
+                a.3 = a.3.max(c.z);
+            }
+            a
+        };
+        if wx0 > wx1 {
+            return Err("这个维度还没有区块".into());
+        }
+
+        let base = ChunkSelection {
+            x0: vx0.max(wx0),
+            z0: vz0.max(wz0),
+            x1: vx1.min(wx1),
+            z1: vz1.min(wz1),
+        };
+        let (bx0, bz0, bx1, bz1) = base.normalized();
+        if bx0 > bx1 || bz0 > bz1 {
+            return Err("可视范围内没有区块".into());
+        }
+
+        // ---- 第二步：从可见矩形里挖掉现有选区 ----
+        let mut keep: Vec<ChunkSelection> = Vec::new();
+        if multi {
+            keep.extend(confirmed);
+        }
+        if let Some(sel) = current {
+            keep.push(sel);
+        }
+
+        let mut pieces = vec![base];
+        for cut in &keep {
+            let mut next: Vec<ChunkSelection> = Vec::new();
+            for piece in pieces {
+                next.extend(subtract_rect(piece, *cut));
+            }
+            pieces = next;
+            if pieces.is_empty() {
+                break;
+            }
+        }
+
+        // ---- 第三步：写回 ----
+        let n = pieces.len();
+        let v = tab.ensure_view(&dim_id);
+        v.selections = pieces;
+        v.selection = None;
+        v.multi_select = n > 0;
+        Ok(n)
+    }
+
     /// 按 id 找标签页。
     ///
     /// 后台任务的结果必须走这里，而不是 `tab_mut()`（当前的激活页）——
@@ -1700,5 +1794,144 @@ fn slice_key(mode: &mcworld_core::chunk::SliceMode) -> String {
     match mode {
         mcworld_core::chunk::SliceMode::Surface => "surface".to_string(),
         mcworld_core::chunk::SliceMode::Fixed(y) => format!("fixed:{y}"),
+    }
+}
+
+/// 矩形 A 减去矩形 B，返回若干互不重叠的矩形（最多 4 块）。
+///
+/// 用来实现"反选"：选区是矩形，而矩形的补集一般不是矩形，
+/// 所以结果是一组矩形。全部按闭区间处理（区块坐标）。
+fn subtract_rect(a: ChunkSelection, b: ChunkSelection) -> Vec<ChunkSelection> {
+    let (ax0, az0, ax1, az1) = a.normalized();
+    let (bx0, bz0, bx1, bz1) = b.normalized();
+
+    // 不相交：原样保留
+    if bx1 < ax0 || bx0 > ax1 || bz1 < az0 || bz0 > az1 {
+        return vec![a];
+    }
+
+    let mut out = Vec::new();
+    // 上方整条
+    if bz0 > az0 {
+        out.push(ChunkSelection { x0: ax0, z0: az0, x1: ax1, z1: bz0 - 1 });
+    }
+    // 下方整条
+    if bz1 < az1 {
+        out.push(ChunkSelection { x0: ax0, z0: bz1 + 1, x1: ax1, z1: az1 });
+    }
+    // 中间重叠那一带，左右各一条
+    let mz0 = bz0.max(az0);
+    let mz1 = bz1.min(az1);
+    if bx0 > ax0 {
+        out.push(ChunkSelection { x0: ax0, z0: mz0, x1: bx0 - 1, z1: mz1 });
+    }
+    if bx1 < ax1 {
+        out.push(ChunkSelection { x0: bx1 + 1, z0: mz0, x1: ax1, z1: mz1 });
+    }
+    out
+}
+
+
+#[cfg(test)]
+mod invert_tests {
+    use super::*;
+
+    fn sel(x0: i32, z0: i32, x1: i32, z1: i32) -> ChunkSelection {
+        ChunkSelection { x0, z0, x1, z1 }
+    }
+
+    /// 计算若干矩形覆盖的格数（用来验证"补集 + 原选区 = 原范围"）
+    fn area(list: &[ChunkSelection]) -> i64 {
+        list.iter()
+            .map(|r| {
+                let (a, b, c, d) = r.normalized();
+                (c as i64 - a as i64 + 1) * (d as i64 - b as i64 + 1)
+            })
+            .sum()
+    }
+
+    #[test]
+    fn subtract_without_overlap_keeps_original() {
+        let a = sel(0, 0, 9, 9);
+        let b = sel(100, 100, 110, 110);
+        let out = subtract_rect(a, b);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].normalized(), (0, 0, 9, 9));
+    }
+
+    #[test]
+    fn subtract_full_cover_yields_nothing() {
+        let a = sel(0, 0, 9, 9);
+        let b = sel(-5, -5, 20, 20);
+        assert!(subtract_rect(a, b).is_empty());
+    }
+
+    #[test]
+    fn subtract_middle_block_yields_four_pieces() {
+        let a = sel(0, 0, 9, 9);
+        let b = sel(4, 4, 5, 5);
+        let out = subtract_rect(a, b);
+        assert_eq!(out.len(), 4, "中间挖一个洞应得到上下左右四块");
+        // 4 块之和必须等于原矩形减去挖掉的 4 格
+        assert_eq!(area(&out), 100 - 4);
+    }
+
+    #[test]
+    fn subtract_left_half_yields_one_piece() {
+        let a = sel(0, 0, 9, 9);
+        let b = sel(0, 0, 4, 9);
+        let out = subtract_rect(a, b);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].normalized(), (5, 0, 9, 9));
+    }
+
+    #[test]
+    fn subtract_top_strip_yields_one_piece() {
+        let a = sel(0, 0, 9, 9);
+        let b = sel(0, 0, 9, 3);
+        let out = subtract_rect(a, b);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].normalized(), (0, 4, 9, 9));
+    }
+
+    /// 反选的核心不变量：可见范围 = 现有选区 ∪ 补集（互不重叠，面积相加相等）。
+    #[test]
+    fn complement_covers_exactly_the_remainder() {
+        let visible = sel(0, 0, 19, 19);
+        let picked = [sel(2, 2, 5, 5), sel(10, 0, 12, 3)];
+
+        let mut pieces = vec![visible];
+        for cut in &picked {
+            let mut next = Vec::new();
+            for piece in pieces {
+                next.extend(subtract_rect(piece, *cut));
+            }
+            pieces = next;
+        }
+
+        let picked_area: i64 = picked.iter().map(|r| area(&[*r])).sum();
+        assert_eq!(
+            area(&pieces) + picked_area,
+            area(&[visible]),
+            "补集面积 + 选区面积 必须等于可见范围面积"
+        );
+
+        // 补集之间不能互相重叠
+        for i in 0..pieces.len() {
+            for j in (i + 1)..pieces.len() {
+                let (ax0, az0, ax1, az1) = pieces[i].normalized();
+                let (bx0, bz0, bx1, bz1) = pieces[j].normalized();
+                let overlap = ax0 <= bx1 && bx0 <= ax1 && az0 <= bz1 && bz0 <= az1;
+                assert!(!overlap, "第 {i} 块和第 {j} 块重叠了");
+            }
+        }
+    }
+
+    /// 选满整个可见范围后反选结果应为空。
+    #[test]
+    fn complement_is_empty_when_fully_selected() {
+        let visible = sel(0, 0, 9, 9);
+        let out = subtract_rect(visible, sel(0, 0, 9, 9));
+        assert!(out.is_empty());
     }
 }

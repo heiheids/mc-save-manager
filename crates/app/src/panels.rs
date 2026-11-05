@@ -288,6 +288,31 @@ pub fn toolbar(app: &mut App, ctx: &egui::Context) {
                                 );
                             }
                         }
+
+                        // ---- 反选 ----
+                        // 只在**可视范围内**取补集：屏幕外不参与，
+                        // 否则缩小到看全图时一按反选就把整个世界都选进来了。
+                        let can_invert = app
+                            .tab()
+                            .map(|t| t.view().canvas_size.is_some())
+                            .unwrap_or(false);
+                        if ui
+                            .add_enabled(can_invert, egui::Button::new("反选").small())
+                            .on_hover_text("把当前选区在可视范围内的补集设为新选区；屏幕外的部分不参与反选。")
+                            .clicked()
+                        {
+                            match app.invert_selection() {
+                                Ok(0) => app.set_status(
+                                    "反选结果为空：可视范围已经被选满了",
+                                    StatusKind::Info,
+                                ),
+                                Ok(n) => app.set_status(
+                                    format!("已反选：可视范围内得到 {n} 块区域"),
+                                    StatusKind::Info,
+                                ),
+                                Err(e) => app.set_status(e, StatusKind::Error),
+                            }
+                        }
                     }
 
                     ui.separator();

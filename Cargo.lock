@@ -1466,7 +1466,7 @@ dependencies = [
 
 [[package]]
 name = "mcworld-app"
-version = "1.0.7"
+version = "1.0.8"
 dependencies = [
  "eframe",
  "egui",
@@ -1477,7 +1477,7 @@ dependencies = [
 
 [[package]]
 name = "mcworld-core"
-version = "1.0.7"
+version = "1.0.8"
 dependencies = [
  "flate2",
  "indexmap",

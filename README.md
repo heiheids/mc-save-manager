@@ -12,7 +12,7 @@
 > level without needing the game running. Supports **1.21.1** through
 > **26.4 snapshots**. [Jump to English](#english)
 
-![版本](https://img.shields.io/badge/version-1.0.7-brightgreen)
+![版本](https://img.shields.io/badge/version-1.0.8-brightgreen)
 ![协议](https://img.shields.io/badge/license-GPL--3.0-blue)
 
 **中文** | [English](#english)
@@ -34,6 +34,8 @@
 
 - 框选任意区域，删除区块
 - **多位置选择**：勾选后可累积多个选区，统一删除或批量导出
+- **反选**：把当前选区在**可视范围内**的补集设为新选区；屏幕外的部分不参与，
+  再点一次即可反回原状
 - 复制 / 粘贴区块（含方块实体与实体）
 - 查看每个区块内的实体类型分布，可只清空某个区块的实体
 
@@ -249,7 +251,7 @@ A Minecraft save editor written in Rust. It edits the world directly at the
 save-file level — no need for the game to be running. Supports **1.21.1**
 through **26.4 snapshots**.
 
-![version](https://img.shields.io/badge/version-1.0.7-brightgreen)
+![version](https://img.shields.io/badge/version-1.0.8-brightgreen)
 ![license](https://img.shields.io/badge/license-GPL--3.0-blue)
 
 ---
