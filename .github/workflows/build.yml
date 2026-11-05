@@ -179,7 +179,7 @@ jobs:
       # 这样每次发布前写好的更新说明会原样出现在 Release 页面。
       - name: Build release notes from tag message
         run: |
-          git tag -l --format=%(contents) "${GITHUB_REF_NAME}" > raw.md
+          git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > raw.md
 
           # 首行如果只是版本号本身就去掉；如果写的是正文就原样保留。
           if [ "$(head -1 raw.md)" = "${GITHUB_REF_NAME}" ]; then
